@@ -41,8 +41,9 @@ MainWindow::MainWindow(QWidget *parent)
     outputPane->appendPlainText("[TeamHub] Ready.");
     updateWindowTitle();
 
-    rgamanager = new RGAManager(1 ,this);
-    rgamanager->connectToServer("ws://localhost:8765/room1");
+    rgamanager = new RGAManager((rand()%50)+100 ,this);
+    connect(rgamanager, &RGAManager::textChanged,
+            this, &MainWindow::onCollabTextChanged);
 }
 
 MainWindow::~MainWindow() = default;
@@ -157,8 +158,17 @@ void MainWindow::setupMainToolBar()
     tb->addSeparator();
 
     auto *actCollab = tb->addAction("Collab");
-    actCollab->setToolTip("Start collaborative editing session  —  stub");
-    actCollab->setEnabled(false);
+    actCollab->setToolTip("Start collaborative editing session");
+    actCollab->setCheckable(true);
+    connect(actCollab, &QAction::triggered, this, [this](bool checked) {
+        if (checked) {
+            rgamanager->connectToServer("ws://localhost:8765/room1");
+            startCollab();
+        } else {
+            rgamanager->disconnectFromServer();
+            stopCollab();
+        }
+    });
 
     auto *actCall = tb->addAction("Call");
     actCall->setToolTip("Toggle Voice");
@@ -880,4 +890,74 @@ void MainWindow::toggleVoipDock()
 {
     voipDock->setVisible(!voipDock->isVisible());
     btnVoip->setChecked(voipDock->isVisible());
+}
+
+void MainWindow::onCollabTextChanged(const QString& newText)
+{
+    if (!editor) return;
+    // Оновлюємо редактор текстом від іншого клієнта
+    editor->applyRemoteText(newText);
+}
+
+void MainWindow::onEditorTextChangedForCollab()
+{
+    if (!collabActive) return;
+    if (editor->isApplyingRemote()) return;
+
+    QString editorText = editor->text();
+    QString rgaText    = rgamanager->getText();
+
+    if (editorText == rgaText) return;
+
+    int pos = 0;
+    while (pos < editorText.length() && pos < rgaText.length()
+           && editorText[pos] == rgaText[pos]) {
+        pos++;
+    }
+
+    if (editorText.length() > rgaText.length()) {
+        for (int i = pos; i < editorText.length() - (rgaText.length() - pos); i++) {
+            rgamanager->localInsert(i, editorText[i]);
+        }
+    } else if (editorText.length() < rgaText.length()) {
+        int deleteCount = rgaText.length() - editorText.length();
+        for (int i = 0; i < deleteCount; i++) {
+            rgamanager->localRemove(pos);
+        }
+    }
+}
+
+void MainWindow::startCollab()
+{
+    bool ok;
+    QString room = QInputDialog::getText(
+        this, "Join Session",
+        "Room name:", QLineEdit::Normal,
+        "room1", &ok);
+
+    if (!ok || room.isEmpty()) return;
+
+    QString url = "ws://localhost:8765/" + room;
+    rgamanager->connectToServer(url);
+    collabActive = true;
+
+    connect(editor, &CodeEditor::fileModified,
+            this, &MainWindow::onEditorTextChangedForCollab);
+
+    outputPane->appendPlainText("[Collab] Connecting to " + url);
+}
+
+void MainWindow::stopCollab()
+{
+    collabActive = false;
+
+    disconnect(editor, &CodeEditor::fileModified,
+               this, &MainWindow::onEditorTextChangedForCollab);
+
+    outputPane->appendPlainText("[Collab] Session stopped.");
+}
+
+CodeEditor* MainWindow::currentEditor()
+{
+    return qobject_cast<CodeEditor*>(editorTabs->currentWidget());
 }

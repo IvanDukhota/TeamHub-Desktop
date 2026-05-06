@@ -71,6 +71,7 @@ private:
 
     // RGA Colab
     RGAManager* rgamanager;
+    bool collabActive = false;
 
     //Setup UI
     void setupMenuBar();
@@ -88,6 +89,8 @@ private:
     void updateWindowTitle();
 
     void clearTabs();
+
+    CodeEditor* currentEditor();
 
 private slots:
     void onActivityButton(int page);
@@ -107,6 +110,11 @@ private slots:
     void toggleSidePanel();
     void toggleBottomDock();
     void toggleVoipDock();
+
+    void onCollabTextChanged(const QString& newText);
+    void onEditorTextChangedForCollab();
+    void startCollab();
+    void stopCollab();
 };
 
 #endif // MAINWINDOW_H

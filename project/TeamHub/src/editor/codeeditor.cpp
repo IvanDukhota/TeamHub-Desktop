@@ -467,3 +467,13 @@ void CodeEditor::resetZoom()
     zoomTo(0);
     zoomLevel = 0;
 }
+
+void CodeEditor::applyRemoteText(const QString& newText){
+    applyingRemote = true;
+    int line, col;
+    getCursorPosition(&line, &col);
+    setText(newText);
+    setCursorPosition(line, col);
+    setModified(true);
+    applyingRemote = false;
+}

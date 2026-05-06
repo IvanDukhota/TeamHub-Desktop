@@ -31,6 +31,9 @@ public:
     int  currentLine() const;
     int  currentColumn() const;
 
+    void applyRemoteText(const QString& newText);
+    bool isApplyingRemote() const { return applyingRemote; }
+
 public slots:
     void resetZoom();
     void onCursorChanged(int line, int index);
@@ -68,6 +71,7 @@ private:
     int               zoomLevel;
     QProcess*         lintProcess;
     QTimer*           lintTimer;
+    bool              applyingRemote = false;
 };
 
 #endif // CODEEDITOR_H
