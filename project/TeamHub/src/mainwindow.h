@@ -112,7 +112,6 @@ private slots:
     void toggleVoipDock();
 
     void onCollabTextChanged(const QString& newText);
-    void onEditorTextChangedForCollab();
     void startCollab();
     void stopCollab();
 };

@@ -37,6 +37,11 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onCursorPositionUpdated);
     connect(editor, &CodeEditor::modifyChanged,
             this, &MainWindow::onModificationChanged);
+    connect(editor, &CodeEditor::charInserted,
+            this, [this](int pos, QChar ch) {
+                if (!collabActive || editor->isApplyingRemote()) return;
+                rgamanager->localInsert(pos, ch);
+            });
 
     outputPane->appendPlainText("[TeamHub] Ready.");
     updateWindowTitle();
@@ -162,7 +167,6 @@ void MainWindow::setupMainToolBar()
     actCollab->setCheckable(true);
     connect(actCollab, &QAction::triggered, this, [this](bool checked) {
         if (checked) {
-            rgamanager->connectToServer("ws://localhost:8765/room1");
             startCollab();
         } else {
             rgamanager->disconnectFromServer();
@@ -299,6 +303,11 @@ void MainWindow::openFileFromBrowser(const QString& path)
             this, &MainWindow::onCursorPositionUpdated);
     connect(newEditor, &CodeEditor::modifyChanged,
             this, &MainWindow::onModificationChanged);
+    connect(newEditor, &CodeEditor::charInserted,
+            this, [this, newEditor](int pos, QChar ch) {
+                if (!collabActive || newEditor->isApplyingRemote()) return;
+                rgamanager->localInsert(pos, ch);
+            });
     const QString name = QFileInfo(path).fileName();
     int index = editorTabs->addTab(newEditor, name);
     editorTabs->setCurrentIndex(index);
@@ -807,6 +816,11 @@ void MainWindow::openFile()
             this, &MainWindow::onCursorPositionUpdated);
     connect(newEditor, &CodeEditor::modifyChanged,
             this, &MainWindow::onModificationChanged);
+    connect(newEditor, &CodeEditor::charInserted,
+            this, [this, newEditor](int pos, QChar ch) {
+                if (!collabActive || newEditor->isApplyingRemote()) return;
+                rgamanager->localInsert(pos, ch);
+            });
     const QString name = QFileInfo(path).fileName();
     int index = editorTabs->addTab(newEditor, name);
     editorTabs->setCurrentIndex(index);
@@ -895,36 +909,7 @@ void MainWindow::toggleVoipDock()
 void MainWindow::onCollabTextChanged(const QString& newText)
 {
     if (!editor) return;
-    // Оновлюємо редактор текстом від іншого клієнта
     editor->applyRemoteText(newText);
-}
-
-void MainWindow::onEditorTextChangedForCollab()
-{
-    if (!collabActive) return;
-    if (editor->isApplyingRemote()) return;
-
-    QString editorText = editor->text();
-    QString rgaText    = rgamanager->getText();
-
-    if (editorText == rgaText) return;
-
-    int pos = 0;
-    while (pos < editorText.length() && pos < rgaText.length()
-           && editorText[pos] == rgaText[pos]) {
-        pos++;
-    }
-
-    if (editorText.length() > rgaText.length()) {
-        for (int i = pos; i < editorText.length() - (rgaText.length() - pos); i++) {
-            rgamanager->localInsert(i, editorText[i]);
-        }
-    } else if (editorText.length() < rgaText.length()) {
-        int deleteCount = rgaText.length() - editorText.length();
-        for (int i = 0; i < deleteCount; i++) {
-            rgamanager->localRemove(pos);
-        }
-    }
 }
 
 void MainWindow::startCollab()
@@ -941,8 +926,12 @@ void MainWindow::startCollab()
     rgamanager->connectToServer(url);
     collabActive = true;
 
-    connect(editor, &CodeEditor::fileModified,
-            this, &MainWindow::onEditorTextChangedForCollab);
+    QTimer::singleShot(500, this, [this]() {
+        QString currentText = editor->text();
+        for (int i = 0; i < currentText.length(); i++) {
+            rgamanager->localInsert(i, currentText[i]);
+        }
+    });
 
     outputPane->appendPlainText("[Collab] Connecting to " + url);
 }
@@ -950,10 +939,6 @@ void MainWindow::startCollab()
 void MainWindow::stopCollab()
 {
     collabActive = false;
-
-    disconnect(editor, &CodeEditor::fileModified,
-               this, &MainWindow::onEditorTextChangedForCollab);
-
     outputPane->appendPlainText("[Collab] Session stopped.");
 }
 

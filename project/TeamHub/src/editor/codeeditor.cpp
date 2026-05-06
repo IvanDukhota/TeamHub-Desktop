@@ -106,6 +106,9 @@ void CodeEditor::setupEditor()
 
     SendScintilla(SCI_SETMULTIPLESELECTION, 1);
     SendScintilla(SCI_SETADDITIONALSELECTIONTYPING, 1);
+
+    connect(this, SIGNAL(SCN_CHARADDED(int)),
+            this, SLOT(onCharAdded(int)));
 }
 
 void CodeEditor::onCursorChanged(int line, int index){
@@ -468,12 +471,27 @@ void CodeEditor::resetZoom()
     zoomLevel = 0;
 }
 
-void CodeEditor::applyRemoteText(const QString& newText){
+void CodeEditor::applyRemoteText(const QString& newText)
+{
     applyingRemote = true;
+
+    blockSignals(true);
+
     int line, col;
     getCursorPosition(&line, &col);
     setText(newText);
     setCursorPosition(line, col);
-    setModified(true);
+
+    blockSignals(false);
+
     applyingRemote = false;
+}
+
+void CodeEditor::onCharAdded(int ch)
+{
+    if (applyingRemote) return;
+    int line, col;
+    getCursorPosition(&line, &col);
+    int pos = positionFromLineIndex(line, col) - 1;
+    emit charInserted(pos, QChar(ch));
 }
