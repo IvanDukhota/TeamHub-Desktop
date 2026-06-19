@@ -11,6 +11,7 @@
 #include "teammanager.h"
 
 class AuthManager;
+class QFrame;
 class VoiceChat;
 
 class TeamsPanel : public QWidget
@@ -63,6 +64,7 @@ private:
     bool micMuted = false;
     bool audioMuted = false;
     QMap<int, QString> voipNicknames;
+    QMap<int, QWidget *> speakingFrames;
 
     void setupUi();
     QWidget *makeCallPane();
@@ -72,6 +74,8 @@ private:
     QWidget *makeTeamRow(const TeamManager::TeamInfo &team);
     QWidget *makeMemberRow(const TeamManager::MemberInfo &member);
     QWidget *makeRoomRow(const TeamManager::RoomInfo &room);
+    QWidget *makePeerRow(const QString &name, const QString &avatarUrl, int peerId, bool isMe);
+    void setPeerSpeaking(int peerId, bool speaking);
 
     void openTeamDetail(const QString &teamId, const QString &teamName);
     void backToTeamsList();

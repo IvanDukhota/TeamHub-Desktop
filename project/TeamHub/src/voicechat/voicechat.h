@@ -24,6 +24,7 @@ struct PeerInfo
     QString ip;
     quint16 port = 0;
     QString name;
+    QString avatarUrl;
     bool connected = false;
     QAudioSink *sink = nullptr;
     QIODevice *output = nullptr;
@@ -50,9 +51,11 @@ public:
     void setAuthToken(const QString &t) { authToken = t; }
     void setTeamId(const QString &t) { teamId = t; }
     void setUsername(const QString &n) { username = n; }
+    void setAvatarUrl(const QString &u) { avatarUrl_ = u; }
     int id() const { return publicId; }
     bool isHost() const { return isRoomHost_; }
     QString peerName(int peerId) const;
+    QString peerAvatarUrl(int peerId) const;
 
     void setPeerMuted(int peerId, bool muted);
     void setPeerVolume(int peerId, float volume);
@@ -76,6 +79,8 @@ signals:
     void disconnectedFromServer();
     void peersUpdated(const QStringList &ids);
     void registrationDenied(const QString &reason);
+    void speakingChanged(bool speaking);
+    void peerSpeakingChanged(int peerId, bool speaking);
 
 private slots:
     void onUdpReadyRead();
@@ -129,6 +134,11 @@ private:
     QString authToken;
     QString teamId;
     QString username;
+    QString avatarUrl_;
+
+    QTimer *silenceTimer = nullptr;
+    bool isSpeaking = false;
+    static constexpr float SPEAKING_THRESHOLD = 800.0f;
 };
 
 #endif // VOICECHAT_H

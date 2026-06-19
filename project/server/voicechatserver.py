@@ -124,6 +124,7 @@ async def handle_client(websocket):
                     "id": data["id"],
                     "mode": data.get("mode", "hybrid"),
                     "username": data.get("username", ""),
+                    "avatarUrl": data.get("avatarUrl", ""),
                 }
 
                 clients[websocket] = {
@@ -133,6 +134,7 @@ async def handle_client(websocket):
                     "port": data["port"],
                     "mode": data.get("mode", "hybrid"),
                     "username": data.get("username", ""),
+                    "avatarUrl": data.get("avatarUrl", ""),
                 }
 
                 if room not in rooms:
@@ -146,6 +148,17 @@ async def handle_client(websocket):
                 rooms[room]["peers"].append(peer)
 
                 await broadcast_room(room)
+                continue
+
+            if msg_type == "speaking":
+                info = clients.get(websocket)
+                if info:
+                    for ws, c in list(clients.items()):
+                        if c["room"] == info["room"] and ws != websocket:
+                            try:
+                                await ws.send(message)
+                            except Exception:
+                                pass
                 continue
 
             if msg_type == "voip_kick":

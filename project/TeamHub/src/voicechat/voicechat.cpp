@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QMediaDevices>
 #include <QNetworkDatagram>
+#include <cmath>
 
 static constexpr const char *STUN_HOST = "stun.l.google.com";
 static constexpr quint16 STUN_PORT = 19302;
@@ -57,6 +58,23 @@ VoiceChat::VoiceChat(QObject *parent)
     flushTimer = new QTimer(this);
     flushTimer->setSingleShot(false);
     flushTimer->setInterval(40);
+
+    silenceTimer = new QTimer(this);
+    silenceTimer->setSingleShot(true);
+    silenceTimer->setInterval(400);
+    connect(silenceTimer, &QTimer::timeout, this, [this]() {
+        if (!isSpeaking)
+            return;
+        isSpeaking = false;
+        emit speakingChanged(false);
+        if (webSocket->state() == QAbstractSocket::ConnectedState) {
+            QJsonObject msg;
+            msg["type"] = "speaking";
+            msg["id"] = publicId;
+            msg["speaking"] = false;
+            webSocket->sendTextMessage(QJsonDocument(msg).toJson(QJsonDocument::Compact));
+        }
+    });
 }
 
 VoiceChat::~VoiceChat()
@@ -145,10 +163,14 @@ void VoiceChat::startCall()
 void VoiceChat::stopCall()
 {
     flushTimer->stop();
-
     captureBuffer.clear();
-
     punchTimer->stop();
+
+    silenceTimer->stop();
+    if (isSpeaking) {
+        isSpeaking = false;
+        emit speakingChanged(false);
+    }
 
     if (audioInput) {
         disconnect(audioInput, &QIODevice::readyRead, this, &VoiceChat::onAudioInputReady);
@@ -421,6 +443,11 @@ void VoiceChat::onWebSocketTextMessageReceived(const QString &message)
         return;
     }
 
+    if (type == "speaking") {
+        emit peerSpeakingChanged(obj.value("id").toInt(), obj.value("speaking").toBool());
+        return;
+    }
+
     if (type == "voip_kicked") {
         emit voipKicked();
         disconnectFromServer();
@@ -450,6 +477,7 @@ void VoiceChat::registerWithServer()
     msg["token"] = authToken;
     msg["team_id"] = teamId;
     msg["username"] = username;
+    msg["avatarUrl"] = avatarUrl_;
 
     webSocket->sendTextMessage(QJsonDocument(msg).toJson(QJsonDocument::Compact));
 }
@@ -462,6 +490,14 @@ QString VoiceChat::peerName(int peerId) const
     return QString();
 }
 
+QString VoiceChat::peerAvatarUrl(int peerId) const
+{
+    for (const PeerInfo &p : peers)
+        if (p.id == peerId)
+            return p.avatarUrl;
+    return QString();
+}
+
 void VoiceChat::updatePeerList(const QJsonArray &peerArray)
 {
     struct Entry
@@ -470,6 +506,7 @@ void VoiceChat::updatePeerList(const QJsonArray &peerArray)
         quint16 port;
         int id;
         QString name;
+        QString avatarUrl;
     };
 
     QList<Entry> incoming;
@@ -480,7 +517,8 @@ void VoiceChat::updatePeerList(const QJsonArray &peerArray)
         Entry e{o.value("ip").toString(),
                 quint16(o.value("port").toInt()),
                 o.value("id").toInt(),
-                o.value("username").toString()};
+                o.value("username").toString(),
+                o.value("avatarUrl").toString()};
 
         if (e.id == publicId)
             continue;
@@ -514,6 +552,7 @@ void VoiceChat::updatePeerList(const QJsonArray &peerArray)
             if (p.id == e.id) {
                 already = true;
                 p.name = e.name;
+                p.avatarUrl = e.avatarUrl;
                 break;
             }
         }
@@ -524,6 +563,7 @@ void VoiceChat::updatePeerList(const QJsonArray &peerArray)
             peer.port = e.port;
             peer.id = e.id;
             peer.name = e.name;
+            peer.avatarUrl = e.avatarUrl;
 
             peers.append(peer);
 
@@ -667,6 +707,30 @@ void VoiceChat::onAudioInputReady()
         return;
 
     QByteArray data = audioInput->readAll();
+
+    {
+        const int n = data.size() / 2;
+        const auto *s = reinterpret_cast<const opus_int16 *>(data.constData());
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i)
+            sum += float(s[i]) * float(s[i]);
+        const float rms = (n > 0 && !micMuted) ? std::sqrt(sum / float(n)) : 0.0f;
+
+        if (rms > SPEAKING_THRESHOLD) {
+            silenceTimer->start();
+            if (!isSpeaking) {
+                isSpeaking = true;
+                emit speakingChanged(true);
+                if (webSocket->state() == QAbstractSocket::ConnectedState) {
+                    QJsonObject msg;
+                    msg["type"] = "speaking";
+                    msg["id"] = publicId;
+                    msg["speaking"] = true;
+                    webSocket->sendTextMessage(QJsonDocument(msg).toJson(QJsonDocument::Compact));
+                }
+            }
+        }
+    }
 
     if (micMuted)
         return;

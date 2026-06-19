@@ -7,6 +7,11 @@
 #include "settings/settingsdialog.h"
 #include "settings/settingsmanager.h"
 
+#ifdef Q_OS_WIN
+#include <dwmapi.h>
+#include <windows.h>
+#endif
+
 #include <QApplication>
 #include <QButtonGroup>
 #include <QClipboard>
@@ -62,13 +67,41 @@ static QIcon loadIconTransparent(const QString &name, bool removeDark = false)
     return QIcon(QPixmap::fromImage(img));
 }
 
+static QString processedIcon(const QString &name)
+{
+    const QString runtimeDir = QCoreApplication::applicationDirPath() + "/icons/";
+    const QString dest = runtimeDir + "_proc_" + name;
+    if (QFile::exists(dest))
+        return QString(dest).replace('\\', '/');
+    QImage img(QString(TEAMHUB_ICONS_DIR) + name);
+    if (img.isNull())
+        img = QImage(runtimeDir + name);
+    if (img.isNull())
+        return (QString(TEAMHUB_ICONS_DIR) + name).replace('\\', '/');
+    img = img.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < img.height(); ++y)
+        for (int x = 0; x < img.width(); ++x) {
+            const QColor c(img.pixel(x, y));
+            if (c.red() > 230 && c.green() > 230 && c.blue() > 230)
+                img.setPixel(x, y, qRgba(0, 0, 0, 0));
+        }
+    QDir().mkpath(runtimeDir);
+    img.save(dest, "PNG");
+    return QString(dest).replace('\\', '/');
+}
+
 static QString loadStyle(const QString &name)
 {
     QFile f(QCoreApplication::applicationDirPath() + "/styles/" + name);
     if (!f.open(QIODevice::ReadOnly))
         f.setFileName(QString(TEAMHUB_STYLES_DIR) + name);
-    if (f.isOpen() || f.open(QIODevice::ReadOnly))
-        return QString::fromUtf8(f.readAll());
+    if (f.isOpen() || f.open(QIODevice::ReadOnly)) {
+        QString s = QString::fromUtf8(f.readAll());
+        s.replace("${ICONS_DIR}arrow_down.png", processedIcon("arrow_down.png"));
+        s.replace("${ICONS_DIR}arrow_up.png", processedIcon("arrow_up.png"));
+        s.replace("${ICONS_DIR}", QString(TEAMHUB_ICONS_DIR));
+        return s;
+    }
     return {};
 }
 
@@ -77,6 +110,7 @@ MainWindow::MainWindow(QWidget *parent)
     , activeSidePanel(0)
 {
     setWindowTitle("TeamHub");
+    setWindowIcon(QIcon(QCoreApplication::applicationDirPath() + "/icons/th.ico"));
     resize(1400, 900);
     setMinimumSize(800, 500);
 
@@ -124,6 +158,20 @@ MainWindow::MainWindow(QWidget *parent)
 }
 
 MainWindow::~MainWindow() = default;
+
+void MainWindow::showEvent(QShowEvent *event)
+{
+    QMainWindow::showEvent(event);
+#ifdef Q_OS_WIN
+    const HWND hwnd = reinterpret_cast<HWND>(winId());
+    const BOOL dark = TRUE;
+    if (FAILED(
+            DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(hwnd, 19, &dark, sizeof(dark));
+    const COLORREF captionColor = RGB(0x1e, 0x1e, 0x1e);
+    DwmSetWindowAttribute(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &captionColor, sizeof(captionColor));
+#endif
+}
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
 {
@@ -979,19 +1027,24 @@ void MainWindow::setupActivityBar()
     vbox->setContentsMargins(0, 8, 0, 8);
     vbox->setSpacing(0);
 
-    auto makeBtn = [](const QString &label, const QString &tip) {
+    auto makeBtn = [](const QString &tip, const QString &iconName) {
         auto *btn = new QToolButton;
-        btn->setText(label);
         btn->setToolTip(tip);
         btn->setCheckable(true);
         btn->setFixedSize(48, 48);
         btn->setObjectName("activityBtn");
+        const QIcon ic = loadIconTransparent(iconName);
+        if (!ic.isNull()) {
+            btn->setIcon(ic);
+            btn->setIconSize(QSize(24, 24));
+            btn->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        }
         return btn;
     };
 
-    btnFiles = makeBtn("Files", "Explorer  (Ctrl+B)");
-    btnCollab = makeBtn("Collab", "Collaboration");
-    btnTeam = makeBtn("Team", "Team");
+    btnFiles = makeBtn("Explorer  (Ctrl+B)", "files.png");
+    btnCollab = makeBtn("Collaboration", "partnership.png");
+    btnTeam = makeBtn("Team", "team.png");
 
     vbox->addWidget(btnFiles);
     vbox->addWidget(btnCollab);
@@ -999,11 +1052,20 @@ void MainWindow::setupActivityBar()
     vbox->addStretch(1);
 
     btnProfile = new QToolButton;
-    btnProfile->setText("Account");
     btnProfile->setToolTip("Sign in");
     btnProfile->setCheckable(false);
     btnProfile->setFixedSize(48, 48);
     btnProfile->setObjectName("activityBtnProfile");
+    {
+        const QIcon userIc = loadIconTransparent("user.png");
+        if (!userIc.isNull()) {
+            btnProfile->setIcon(userIc);
+            btnProfile->setIconSize(QSize(24, 24));
+            btnProfile->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        } else {
+            btnProfile->setText("User");
+        }
+    }
     vbox->addWidget(btnProfile);
 
     auto requireAuth = [this](const QString &feature) {
@@ -2432,9 +2494,17 @@ void MainWindow::updateProfileButton()
         btnProfile->setToolTip(user.username + "\n\nClick for profile options");
         btnProfile->setProperty("loggedIn", true);
     } else {
-        btnProfile->setToolButtonStyle(Qt::ToolButtonTextOnly);
-        btnProfile->setIcon(QIcon());
-        btnProfile->setText("Account");
+        const QIcon userIc = loadIconTransparent("user.png");
+        if (!userIc.isNull()) {
+            btnProfile->setToolButtonStyle(Qt::ToolButtonIconOnly);
+            btnProfile->setIcon(userIc);
+            btnProfile->setIconSize(QSize(24, 24));
+            btnProfile->setText(QString());
+        } else {
+            btnProfile->setToolButtonStyle(Qt::ToolButtonTextOnly);
+            btnProfile->setIcon(QIcon());
+            btnProfile->setText("User");
+        }
         btnProfile->setToolTip("Sign in");
         btnProfile->setProperty("loggedIn", false);
     }

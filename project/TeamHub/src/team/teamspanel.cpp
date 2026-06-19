@@ -8,17 +8,85 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QColor>
+#include <QCoreApplication>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHash>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QMenu>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
 #include <QSlider>
 #include <QSplitter>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidgetAction>
+
+class AvatarRing : public QWidget
+{
+    QPixmap m_pix;
+    QColor m_ringColor;
+    int m_border;
+
+public:
+    AvatarRing(int totalSize, int border, QWidget *parent = nullptr)
+        : QWidget(parent)
+        , m_ringColor(Qt::transparent)
+        , m_border(border)
+    {
+        setFixedSize(totalSize, totalSize);
+        setAttribute(Qt::WA_TranslucentBackground);
+    }
+    void setPixmap(const QPixmap &p)
+    {
+        m_pix = p;
+        update();
+    }
+    void setRingColor(const QColor &c)
+    {
+        m_ringColor = c;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        if (m_ringColor.alpha() > 0) {
+            p.setBrush(m_ringColor);
+            p.setPen(Qt::NoPen);
+            p.drawEllipse(rect());
+        }
+        if (!m_pix.isNull()) {
+            const int d = m_border;
+            const QRect r(d, d, width() - 2 * d, height() - 2 * d);
+            QPainterPath path;
+            path.addEllipse(r);
+            p.setClipPath(path);
+            p.drawPixmap(r, m_pix.scaled(r.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+        }
+    }
+};
+
+static QIcon loadVoiceIcon(const QString &name)
+{
+    QImage img(QString(TEAMHUB_ICONS_DIR) + name);
+    if (img.isNull())
+        img = QImage(QCoreApplication::applicationDirPath() + "/icons/" + name);
+    if (img.isNull())
+        return QIcon();
+    img = img.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < img.height(); ++y)
+        for (int x = 0; x < img.width(); ++x) {
+            const QColor c(img.pixel(x, y));
+            if (c.red() > 230 && c.green() > 230 && c.blue() > 230)
+                img.setPixel(x, y, qRgba(0, 0, 0, 0));
+        }
+    return QIcon(QPixmap::fromImage(img));
+}
 
 namespace {
 
@@ -100,33 +168,76 @@ QWidget *TeamsPanel::makeCallPane()
             &TeamsPanel::onPeersContextMenu);
     cl->addWidget(peersList, 1);
 
-    auto *callControls = new QHBoxLayout;
-    btnMuteMic = new QPushButton("Mic");
-    btnMuteMic->setObjectName("voipBtn");
-    btnMuteMic->setCheckable(true);
+    const QIcon icMicOn = loadVoiceIcon("mic_on.png");
+    const QIcon icMicOff = loadVoiceIcon("mic_off.png");
+    const QIcon icSound = loadVoiceIcon("sound.png");
+    const QIcon icNoSound = loadVoiceIcon("no-sound.png");
+    const QIcon icLeave = loadVoiceIcon("leave.png");
+
+    const QString discordBtnStyle = "QPushButton {"
+                                    "  background: transparent;"
+                                    "  border: none;"
+                                    "  border-radius: 6px;"
+                                    "  padding: 0px;"
+                                    "}"
+                                    "QPushButton:hover { background: rgba(255,255,255,38); }"
+                                    "QPushButton:pressed { background: rgba(255,255,255,20); }"
+                                    "QPushButton:checked { background: rgba(255,255,255,18); }";
+
+    auto makeIconBtn = [&discordBtnStyle](bool checkable) {
+        auto *btn = new QPushButton;
+        btn->setCheckable(checkable);
+        btn->setFixedSize(34, 34);
+        btn->setIconSize(QSize(20, 20));
+        btn->setStyleSheet(discordBtnStyle);
+        return btn;
+    };
+
+    btnMuteMic = makeIconBtn(true);
     btnMuteMic->setToolTip("Mute microphone");
-    connect(btnMuteMic, &QPushButton::toggled, this, [this](bool on) {
+    if (!icMicOn.isNull())
+        btnMuteMic->setIcon(icMicOn);
+    else
+        btnMuteMic->setText("Mic");
+    connect(btnMuteMic, &QPushButton::toggled, this, [this, icMicOn, icMicOff](bool on) {
         micMuted = on;
+        if (!icMicOn.isNull())
+            btnMuteMic->setIcon(on ? icMicOff : icMicOn);
         if (voiceChat)
             voiceChat->setMicMuted(on);
     });
-    callControls->addWidget(btnMuteMic);
 
-    btnDeafen = new QPushButton("Sound");
-    btnDeafen->setObjectName("voipBtn");
-    btnDeafen->setCheckable(true);
+    btnDeafen = makeIconBtn(true);
     btnDeafen->setToolTip("Deafen");
-    connect(btnDeafen, &QPushButton::toggled, this, [this](bool on) {
+    if (!icSound.isNull())
+        btnDeafen->setIcon(icSound);
+    else
+        btnDeafen->setText("Sound");
+    connect(btnDeafen, &QPushButton::toggled, this, [this, icSound, icNoSound](bool on) {
         audioMuted = on;
+        if (!icSound.isNull())
+            btnDeafen->setIcon(on ? icNoSound : icSound);
         if (voiceChat)
             voiceChat->setAudioMuted(on);
     });
-    callControls->addWidget(btnDeafen);
 
-    btnLeaveCall = new QPushButton("Leave");
-    btnLeaveCall->setObjectName("voipBtn");
+    btnLeaveCall = makeIconBtn(false);
+    btnLeaveCall->setToolTip("Leave room");
+    if (!icLeave.isNull())
+        btnLeaveCall->setIcon(icLeave);
+    else
+        btnLeaveCall->setText("Leave");
     connect(btnLeaveCall, &QPushButton::clicked, this, &TeamsPanel::onLeaveCallClicked);
+
+    auto *callControls = new QHBoxLayout;
+    callControls->setContentsMargins(0, 0, 0, 0);
+    callControls->addStretch(1);
+    callControls->addWidget(btnMuteMic);
+    callControls->addStretch(1);
+    callControls->addWidget(btnDeafen);
+    callControls->addStretch(1);
     callControls->addWidget(btnLeaveCall);
+    callControls->addStretch(1);
     cl->addLayout(callControls);
 
     return pane;
@@ -335,6 +446,12 @@ void TeamsPanel::setVoiceChat(VoiceChat *vc)
     });
 
     connect(voiceChat, &VoiceChat::peersUpdated, this, &TeamsPanel::onPeersUpdated);
+
+    connect(voiceChat, &VoiceChat::speakingChanged, this, [this](bool speaking) {
+        if (voiceChat)
+            setPeerSpeaking(voiceChat->id(), speaking);
+    });
+    connect(voiceChat, &VoiceChat::peerSpeakingChanged, this, &TeamsPanel::setPeerSpeaking);
 
     connect(voiceChat, &VoiceChat::disconnectedFromServer, this, [this]() {
         joiningVoiceRoom = false;
@@ -668,6 +785,7 @@ void TeamsPanel::joinVoiceRoom(const QString &roomKey, const QString &label, con
     voiceChat->setAuthToken(auth->token());
     voiceChat->setTeamId(teamId);
     voiceChat->setUsername(auth->currentUser().username);
+    voiceChat->setAvatarUrl(auth->currentUser().avatarUrl);
 
     voiceChat->setRoom(roomKey);
     emit logMessage("[Voice] Joining room: " + label);
@@ -691,12 +809,50 @@ void TeamsPanel::onLeaveCallClicked()
         return;
 
     voiceChat->disconnectFromServer();
+    speakingFrames.clear();
     peersList->clear();
     currentVoiceRoomKey.clear();
     setLive(false);
     showCallPane(false);
     returnToVoiceRoomTeam();
     emit logMessage("[Voice] Left room");
+}
+
+QWidget *TeamsPanel::makePeerRow(const QString &name,
+                                 const QString &avatarUrl,
+                                 int peerId,
+                                 bool isMe)
+{
+    auto *row = new QWidget;
+    row->setStyleSheet("background: transparent;");
+    auto *h = new QHBoxLayout(row);
+    h->setContentsMargins(8, 6, 8, 6);
+    h->setSpacing(10);
+
+    auto *ring = new AvatarRing(34, 3, row);
+    Avatar::load(ring,
+                 avatarUrl,
+                 Avatar::letterPixmap(Avatar::initialFor(name),
+                                      Avatar::colorForId(QString::number(peerId)),
+                                      28),
+                 28,
+                 [ring](QPixmap pix) { ring->setPixmap(pix); });
+    speakingFrames[peerId] = ring;
+    h->addWidget(ring);
+
+    auto *nameLbl = new QLabel(isMe ? name + " (You)" : name);
+    nameLbl->setObjectName("peerName");
+    nameLbl->setStyleSheet("color: #d4d4d4; font-size: 12px;");
+    h->addWidget(nameLbl, 1);
+
+    return row;
+}
+
+void TeamsPanel::setPeerSpeaking(int peerId, bool speaking)
+{
+    if (auto *w = speakingFrames.value(peerId, nullptr))
+        static_cast<AvatarRing *>(w)->setRingColor(speaking ? QColor("#43b581")
+                                                            : QColor(Qt::transparent));
 }
 
 void TeamsPanel::onPeersUpdated(const QStringList &ids)
@@ -710,20 +866,30 @@ void TeamsPanel::onPeersUpdated(const QStringList &ids)
             voiceChat->startCall();
     }
 
+    speakingFrames.clear();
     peersList->clear();
 
-    auto *meItem = new QListWidgetItem(u8"• You");
-    meItem->setData(Qt::UserRole, voiceChat->id());
+    const QString myName = auth ? auth->currentUser().username : "You";
+    const QString myAvatar = auth ? auth->currentUser().avatarUrl : QString();
+    const int myId = voiceChat->id();
+
+    auto *meItem = new QListWidgetItem;
+    meItem->setSizeHint(QSize(0, 44));
+    meItem->setData(Qt::UserRole, myId);
     peersList->addItem(meItem);
+    peersList->setItemWidget(meItem, makePeerRow(myName, myAvatar, myId, true));
 
     for (const QString &uid : ids) {
         const int peerId = uid.toInt();
-        QString name = voipNicknames.value(peerId, voiceChat->peerName(peerId));
-        if (name.isEmpty())
-            name = uid;
-        auto *item = new QListWidgetItem(u8"• " + name);
+        const QString pName = voiceChat->peerName(peerId);
+        const QString name = voipNicknames.value(peerId, pName.isEmpty() ? uid : pName);
+        const QString avatarUrl = voiceChat->peerAvatarUrl(peerId);
+
+        auto *item = new QListWidgetItem;
+        item->setSizeHint(QSize(0, 44));
         item->setData(Qt::UserRole, peerId);
         peersList->addItem(item);
+        peersList->setItemWidget(item, makePeerRow(name, avatarUrl, peerId, false));
     }
 
     setLive(true);
@@ -771,9 +937,8 @@ void TeamsPanel::onPeersContextMenu(const QPoint &pos)
 
     menu.addSeparator();
 
-    const QString defaultName = voiceChat->peerName(peerId).isEmpty()
-                                     ? QString::number(peerId)
-                                     : voiceChat->peerName(peerId);
+    const QString defaultName = voiceChat->peerName(peerId).isEmpty() ? QString::number(peerId)
+                                                                      : voiceChat->peerName(peerId);
     const QString currentNick = voipNicknames.value(peerId, defaultName);
     menu.addAction("Set nickname", [this, peerId, currentNick, defaultName, item]() {
         bool ok;
@@ -789,7 +954,9 @@ void TeamsPanel::onPeersContextMenu(const QPoint &pos)
             voipNicknames.remove(peerId);
         else
             voipNicknames[peerId] = nick;
-        item->setText(u8"• " + voipNicknames.value(peerId, defaultName));
+        if (auto *w = peersList->itemWidget(item))
+            if (auto *lbl = w->findChild<QLabel *>("peerName"))
+                lbl->setText(voipNicknames.value(peerId, defaultName));
     });
 
     menu.addAction("Copy ID",

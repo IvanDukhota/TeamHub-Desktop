@@ -44,10 +44,10 @@ TerminalEdit::~TerminalEdit()
 
 void TerminalEdit::killProcess()
 {
+    process->disconnect(this);
     if (process->state() != QProcess::NotRunning) {
         process->write("exit\r\n");
-        process->waitForFinished(500);
-        if (process->state() != QProcess::NotRunning)
+        if (!process->waitForFinished(500))
             process->kill();
     }
 }

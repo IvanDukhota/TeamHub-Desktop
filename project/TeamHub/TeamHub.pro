@@ -9,6 +9,9 @@ DEFINES += TEAMHUB_ICONS_DIR=\\\"$$PWD/icons/\\\"
 LIBS += -L$$PWD/libs -lqscintilla2_qt6d -lopus -lgit2
 
 win32 {
+    RC_ICONS = icons/th.ico
+    LIBS += -ldwmapi
+
     QMAKE_POST_LINK += $$QMAKE_COPY \
         $$shell_path($$PWD/libs/qscintilla2_qt6d.dll) \
         $$shell_path($$OUT_PWD/) $$escape_expand(\\n\\t)
