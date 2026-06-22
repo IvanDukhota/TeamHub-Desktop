@@ -44,6 +44,7 @@ public:
     void sendCursorLeave(const QString &relPath);
     void sendFileFocus(const QString &relPath);
     void kickUser(int siteId);
+    void sendRoleChange(int targetSiteId, const QString &role);
     void sendFinalStates(const QMap<QString, QString> &texts);
     void requestSessionReport();
     void endSession();
@@ -54,6 +55,7 @@ public:
     int siteId() const { return currentSiteId; }
     QStringList fileList() const { return files; }
     QString projectRoot() const { return rootPath; }
+    qint64 sessionStartEpoch() const { return startEpoch; }
 
     bool hasTextCache(const QString &relPath) const { return textCache.contains(relPath); }
     QString cachedText(const QString &relPath) const { return textCache.value(relPath); }
@@ -69,12 +71,14 @@ signals:
     void projectInitReceived(int hostSiteId, const QStringList &files);
     void runOutputReceived(const QString &text);
     void usersUpdated(QMap<int, QString> users);
+    void rolesUpdated(QMap<int, QString> roles);
     void remoteFileCreated(const QString &relPath);
     void remoteFileDeleted(const QString &relPath);
     void remoteFileRenamed(const QString &oldPath, const QString &newPath);
     void remoteFileFocusChanged(int siteId, const QString &file);
     void sessionReportReady(const SessionReportData &report);
     void sessionAiInsightsReady(const AiInsights &ai);
+    void peerRoleChanged(int siteId, QString role);
 
 private slots:
     void onConnected();
@@ -108,6 +112,7 @@ private:
     QString serverUrl;
     int reconnectAttempt = 0;
     bool wantReconnect = false;
+    bool sessionEndedByServer = false;
 
     int currentSiteId;
     Role currentRole;
@@ -123,6 +128,7 @@ private:
     QMap<QString, QString> textCache;
     QMap<QString, QDateTime> lastUsed;
     QMap<QString, QMap<int, int>> cursorCache;
+    qint64 startEpoch = 0;
 };
 
 #endif // COLLABSESSION_H

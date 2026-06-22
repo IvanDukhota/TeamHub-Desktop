@@ -243,6 +243,11 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
         return;
     }
 
+    if (collabActive && isReadOnly()) {
+        QsciScintilla::keyPressEvent(event);
+        return;
+    }
+
     if (handleBackspaceInPair(event))
         return;
     if (skipClosingChar(event))
@@ -343,12 +348,62 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
             int pos = SendScintilla(SCI_GETCURRENTPOS);
             if (pos > 0) {
                 const int prevPos = (int) SendScintilla(SCI_POSITIONBEFORE, (ulong) pos);
-                const int byteLen = pos - prevPos;
+                const int lenBefore = (int) SendScintilla(SCI_GETLENGTH);
                 QsciScintilla::keyPressEvent(event);
-                emit localDelete(pos - 1);
-                shiftRemoteCursors(prevPos, -byteLen);
+                const int newPos = (int) SendScintilla(SCI_GETCURRENTPOS);
+                const int bytesDeleted = lenBefore - (int) SendScintilla(SCI_GETLENGTH);
+
+                if (bytesDeleted == pos - prevPos) {
+                    emit localDelete(prevPos);
+                    shiftRemoteCursors(prevPos, -bytesDeleted);
+                } else if (bytesDeleted > 0) {
+                    emit beginUndoGroup();
+                    for (int i = 0; i < bytesDeleted; ++i)
+                        emit localDelete(newPos);
+                    emit endUndoGroup();
+                    shiftRemoteCursors(newPos, -bytesDeleted);
+                }
                 return;
             }
+        }
+
+        if (key == Qt::Key_Tab && mod == Qt::NoModifier) {
+            const int pos = (int) SendScintilla(SCI_GETCURRENTPOS);
+            const int lenBefore = (int) SendScintilla(SCI_GETLENGTH);
+            suppressLocalInsert = true;
+            QsciScintilla::keyPressEvent(event);
+            suppressLocalInsert = false;
+            const int inserted = (int) SendScintilla(SCI_GETLENGTH) - lenBefore;
+            if (inserted > 0) {
+                emit beginUndoGroup();
+                for (int i = 0; i < inserted; ++i) {
+                    emit localInsert(pos + i, QChar(' '));
+                    shiftRemoteCursors(pos + i, 1, false);
+                }
+                emit endUndoGroup();
+                if (cursorOverlay)
+                    cursorOverlay->update();
+            }
+            return;
+        }
+
+        if (key == Qt::Key_Tab && mod == Qt::ShiftModifier) {
+            const int lineNo = (int) SendScintilla(SCI_LINEFROMPOSITION,
+                                                   (ulong) SendScintilla(SCI_GETCURRENTPOS));
+            const int lineStart = (int) SendScintilla(SCI_POSITIONFROMLINE, (ulong) lineNo);
+            const int lenBefore = (int) SendScintilla(SCI_GETLENGTH);
+            suppressLocalInsert = true;
+            QsciScintilla::keyPressEvent(event);
+            suppressLocalInsert = false;
+            const int removed = lenBefore - (int) SendScintilla(SCI_GETLENGTH);
+            if (removed > 0) {
+                emit beginUndoGroup();
+                for (int i = 0; i < removed; ++i)
+                    emit localDelete(lineStart);
+                emit endUndoGroup();
+                shiftRemoteCursors(lineStart, -removed);
+            }
+            return;
         }
 
         if (key == Qt::Key_Delete && mod == Qt::NoModifier) {

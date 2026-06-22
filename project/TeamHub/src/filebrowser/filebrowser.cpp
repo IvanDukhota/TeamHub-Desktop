@@ -3,12 +3,57 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QImage>
+#include <QPainter>
 #include <QPixmap>
 #include <QStyle>
 #include <QVBoxLayout>
 #include <functional>
+
+class GitStatusDelegate : public QStyledItemDelegate {
+public:
+    explicit GitStatusDelegate(QObject *parent = nullptr) : QStyledItemDelegate(parent) {}
+
+    void updateStatus(const QMap<QString, QChar> &status, const QString &root) {
+        statusMap = status;
+        rootPath = root;
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override {
+        QStyledItemDelegate::paint(painter, option, index);
+        if (rootPath.isEmpty()) return;
+        const auto *fsModel = qobject_cast<const QFileSystemModel *>(index.model());
+        if (!fsModel) return;
+        const QString rel = QDir(rootPath).relativeFilePath(fsModel->filePath(index));
+        const QChar sc = statusMap.value(rel, '\0');
+        if (sc == '\0') return;
+        QColor col;
+        switch (sc.toLatin1()) {
+        case 'M': col = QColor("#e2c08d"); break;
+        case 'A': col = QColor("#4ec9b0"); break;
+        case 'D': col = QColor("#f14c4c"); break;
+        case '?': col = QColor("#7ab8f5"); break;
+        case 'R': col = QColor("#b5cea8"); break;
+        default: return;
+        }
+        painter->save();
+        painter->setPen(col);
+        QFont f = painter->font();
+        f.setPixelSize(10);
+        f.setBold(true);
+        painter->setFont(f);
+        painter->drawText(option.rect.adjusted(0, 0, -4, 0),
+                          Qt::AlignRight | Qt::AlignVCenter, QString(sc));
+        painter->restore();
+    }
+
+private:
+    QMap<QString, QChar> statusMap;
+    QString rootPath;
+};
 
 static QIcon loadIconTransparent(const QString &path)
 {
@@ -16,28 +61,50 @@ static QIcon loadIconTransparent(const QString &path)
     if (img.isNull())
         return QIcon();
     img = img.convertToFormat(QImage::Format_ARGB32);
-    for (int y = 0; y < img.height(); ++y) {
-        for (int x = 0; x < img.width(); ++x) {
-            const QColor c(img.pixel(x, y));
-            if (c.red() > 230 && c.green() > 230 && c.blue() > 230)
-                img.setPixel(x, y, qRgba(0, 0, 0, 0));
+
+    const int w = img.width(), h = img.height();
+    auto isWhitish = [&](int x, int y) {
+        const QColor c(img.pixel(x, y));
+        return c.alpha() > 0 && c.red() > 230 && c.green() > 230 && c.blue() > 230;
+    };
+
+    QVector<bool> visited(w * h, false);
+    QList<QPoint> queue;
+
+    auto enqueue = [&](int x, int y) {
+        if (x >= 0 && x < w && y >= 0 && y < h && !visited[y * w + x] && isWhitish(x, y)) {
+            visited[y * w + x] = true;
+            queue.append({x, y});
         }
+    };
+
+    for (int x = 0; x < w; ++x) { enqueue(x, 0); enqueue(x, h - 1); }
+    for (int y = 1; y < h - 1; ++y) { enqueue(0, y); enqueue(w - 1, y); }
+
+    while (!queue.isEmpty()) {
+        const QPoint p = queue.takeFirst();
+        img.setPixel(p.x(), p.y(), qRgba(0, 0, 0, 0));
+        enqueue(p.x() + 1, p.y()); enqueue(p.x() - 1, p.y());
+        enqueue(p.x(), p.y() + 1); enqueue(p.x(), p.y() - 1);
     }
+
     return QIcon(QPixmap::fromImage(img));
 }
 
 class TeamHubIconProvider : public QFileIconProvider
 {
-    QIcon pyIcon;
+    QMap<QString, QIcon> icons;
 
 public:
-    explicit TeamHubIconProvider(const QIcon &icon)
-        : pyIcon(icon)
-    {}
+    void addIcon(const QStringList &exts, const QIcon &icon) {
+        for (const QString &ext : exts)
+            icons[ext] = icon;
+    }
     QIcon icon(const QFileInfo &info) const override
     {
-        if (!pyIcon.isNull() && info.suffix().toLower() == "py")
-            return pyIcon;
+        const QString ext = info.suffix().toLower();
+        if (icons.contains(ext))
+            return icons[ext];
         return QFileIconProvider::icon(info);
     }
 };
@@ -96,15 +163,38 @@ void FileBrowser::setupFileBrowser()
     stack->setVisible(false);
     layout->addWidget(stack);
 
-    QString iconPath = QCoreApplication::applicationDirPath() + "/icons/python.png";
-    pythonIcon = loadIconTransparent(iconPath);
-    if (pythonIcon.isNull())
-        pythonIcon = loadIconTransparent(QString(TEAMHUB_ICONS_DIR) + "python.png");
+    auto loadIcon = [](const QString &name) -> QIcon {
+        QString path = QCoreApplication::applicationDirPath() + "/icons/" + name;
+        QIcon ic = loadIconTransparent(path);
+        if (ic.isNull())
+            ic = loadIconTransparent(QString(TEAMHUB_ICONS_DIR) + name);
+        return ic;
+    };
+
+    struct IconDef { QStringList exts; QString file; };
+    const QList<IconDef> defs = {
+        {{"py"},              "python.png"},
+        {{"cpp","cxx","cc","c"}, "cpp.png"},
+        {{"h","hpp"},        "h.png"},
+        {{"json"},           "json.png"},
+        {{"md"},             "md.png"},
+        {{"pro"},            "pro.png"},
+    };
+
+    auto *iconProvider = new TeamHubIconProvider();
+    for (const auto &def : defs) {
+        QIcon ic = loadIcon(def.file);
+        if (!ic.isNull()) {
+            iconProvider->addIcon(def.exts, ic);
+            for (const QString &ext : def.exts)
+                extIcons[ext] = ic;
+        }
+    }
+    pythonIcon = extIcons.value("py");
 
     model = new QFileSystemModel(this);
     model->setRootPath(QDir::homePath());
-    if (!pythonIcon.isNull())
-        model->setIconProvider(new TeamHubIconProvider(pythonIcon));
+    model->setIconProvider(iconProvider);
 
     tree = new QTreeView(this);
     tree->setModel(model);
@@ -117,11 +207,15 @@ void FileBrowser::setupFileBrowser()
     tree->setAnimated(true);
     tree->setUniformRowHeights(true);
     tree->setObjectName("fileBrowserTree");
+    gitDelegate = new GitStatusDelegate(this);
+    tree->setItemDelegate(gitDelegate);
 
     connect(tree, &QTreeView::doubleClicked, this, &FileBrowser::onItemDoubleClicked);
     connect(searchBox, &QLineEdit::textChanged, this, [this](const QString &text) {
         if (text.isEmpty())
-            model->setNameFilters({"*.py", "*.cpp", "*.h", "*.pro", "*.txt", "*.md"});
+            model->setNameFilters({"*.py", "*.cpp", "*.cxx", "*.cc", "*.c", "*.h", "*.hpp",
+                                   "*.json", "*.pro", "*.txt", "*.md", "*.qml", "*.xml",
+                                   "*.js", "*.ts", "*.html", "*.css"});
         else
             model->setNameFilters({"*" + text + "*"});
     });
@@ -146,23 +240,93 @@ void FileBrowser::setupFileBrowser()
 
 void FileBrowser::setupFilter()
 {
-    model->setNameFilters({"*.py", "*.cpp", "*.h", "*.pro", "*.txt", "*.md"});
+    model->setNameFilters({"*.py", "*.cpp", "*.cxx", "*.cc", "*.c", "*.h", "*.hpp",
+                           "*.json", "*.pro", "*.txt", "*.md", "*.qml", "*.xml",
+                           "*.js", "*.ts", "*.html", "*.css"});
     model->setNameFilterDisables(false);
 }
 
 void FileBrowser::setRootPath(const QString &path)
 {
-    m_projectLoaded = true;
+    projectLoaded = true;
     model->setRootPath(path);
     tree->setRootIndex(model->index(path));
     placeholder->setVisible(false);
     stack->setVisible(true);
     stack->setCurrentIndex(0);
+
+    if (!gitWatcher) {
+        gitWatcher = new QFileSystemWatcher(this);
+        connect(gitWatcher, &QFileSystemWatcher::fileChanged,
+                this, &FileBrowser::refreshGitStatus);
+    } else if (!gitWatcher->files().isEmpty()) {
+        gitWatcher->removePaths(gitWatcher->files());
+    }
+    const QString gitIndex = path + "/.git/index";
+    if (QFileInfo::exists(gitIndex))
+        gitWatcher->addPath(gitIndex);
+
+    refreshGitStatus();
+}
+
+void FileBrowser::refreshGitStatus()
+{
+    const QString root = rootPath();
+    if (root.isEmpty()) return;
+    if (gitStatusProc && gitStatusProc->state() != QProcess::NotRunning)
+        return;
+
+    gitStatusProc = new QProcess(this);
+    gitStatusProc->setWorkingDirectory(root);
+
+    connect(gitStatusProc,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, root](int exitCode) {
+        QMap<QString, QChar> status;
+        if (exitCode == 0) {
+            auto priority = [](QChar c) -> int {
+                switch (c.toLatin1()) {
+                case 'D': return 5; case 'M': return 4; case 'A': return 3;
+                case 'R': return 2; case '?': return 1; default: return 0;
+                }
+            };
+            const QString out = QString::fromUtf8(gitStatusProc->readAllStandardOutput());
+            for (const QString &line : out.split('\n', Qt::SkipEmptyParts)) {
+                if (line.size() < 4) continue;
+                const QChar X = line[0], Y = line[1];
+                QChar sc;
+                if (X == '?' && Y == '?') sc = '?';
+                else if (Y != ' ') sc = Y;
+                else sc = X;
+                if (sc == ' ') continue;
+
+                QString path = line.mid(3).trimmed();
+                if (path.contains(" -> "))
+                    path = path.section(" -> ", -1);
+                status[path] = sc;
+
+                QString parent = QFileInfo(path).dir().path();
+                while (parent != "." && !parent.isEmpty()) {
+                    const QChar ex = status.value(parent, '\0');
+                    if (ex == '\0' || priority(sc) > priority(ex))
+                        status[parent] = sc;
+                    parent = QFileInfo(parent).dir().path();
+                }
+            }
+        }
+        gitStatus = status;
+        if (gitDelegate)
+            gitDelegate->updateStatus(gitStatus, root);
+        tree->viewport()->update();
+        gitStatusProc->deleteLater();
+        gitStatusProc = nullptr;
+    });
+    gitStatusProc->start("git", {"status", "--porcelain"});
 }
 
 QString FileBrowser::rootPath() const
 {
-    return m_projectLoaded ? model->rootPath() : QString();
+    return projectLoaded ? model->rootPath() : QString();
 }
 
 QString FileBrowser::findFile(const QString &filename)
@@ -177,6 +341,8 @@ QString FileBrowser::findFile(const QString &filename)
 void FileBrowser::setRemoteFiles(const QStringList &relPaths)
 {
     remoteTree->clear();
+    placeholder->setVisible(false);
+    stack->setVisible(true);
 
     const QIcon folderIcon = QApplication::style()->standardIcon(QStyle::SP_DirIcon);
     const QIcon defaultFileIcon = QApplication::style()->standardIcon(QStyle::SP_FileIcon);
@@ -211,8 +377,8 @@ void FileBrowser::setRemoteFiles(const QStringList &relPaths)
         QTreeWidgetItem *parent = getOrCreateDir(dirPart);
         QTreeWidgetItem *fileItem = parent ? new QTreeWidgetItem(parent, QStringList(fileName))
                                            : new QTreeWidgetItem(remoteTree, QStringList(fileName));
-        const bool isPython = fileName.endsWith(".py", Qt::CaseInsensitive);
-        fileItem->setIcon(0, isPython && !pythonIcon.isNull() ? pythonIcon : defaultFileIcon);
+        const QString ext = QFileInfo(fileName).suffix().toLower();
+        fileItem->setIcon(0, extIcons.value(ext, defaultFileIcon));
         fileItem->setData(0, Qt::UserRole, relPath);
     }
 
@@ -235,6 +401,10 @@ void FileBrowser::clearRemoteMode()
     remoteTree->clear();
     stack->setCurrentIndex(0);
     searchBox->setEnabled(true);
+    if (!projectLoaded) {
+        stack->setVisible(false);
+        placeholder->setVisible(true);
+    }
 }
 
 void FileBrowser::onItemDoubleClicked(const QModelIndex &index)

@@ -42,6 +42,7 @@ user_file_state: dict[str, dict] = {}
 room_start_time: dict[str, float] = {}
 room_user_joins: dict[str, dict] = {}
 final_file_states: dict[str, dict[str, str]] = {}
+room_peer_roles: dict[str, dict[int, str]] = {}
 
 
 def get_room(path: str) -> str:
@@ -74,11 +75,14 @@ async def broadcast_all(room: str, payload: dict):
 async def broadcast_user_list(room: str):
     names = room_usernames.get(room, {})
     avatars = room_avatars.get(room, {})
+    host_sid = room_host.get(room)
+    peer_roles = room_peer_roles.get(room, {})
     users = [
         {
             "siteId": sid,
             "username": names.get(sid, f"user_{sid}"),
             "avatarUrl": avatars.get(sid, ""),
+            "role": peer_roles.get(sid, "host" if sid == host_sid else "write"),
         }
         for sid in room_users.get(room, {}).values()
         if sid is not None
@@ -89,12 +93,28 @@ async def broadcast_user_list(room: str):
 
 
 async def send_room_state(ws, room: str):
+    host_sid = room_host.get(room)
+    peer_roles = room_peer_roles.get(room, {})
+    existing_users = [
+        {
+            "siteId": sid,
+            "username": room_usernames.get(room, {}).get(sid, f"user_{sid}"),
+            "avatarUrl": room_avatars.get(room, {}).get(sid, ""),
+            "role": peer_roles.get(sid, "host" if sid == host_sid else "write"),
+        }
+        for sid in room_users.get(room, {}).values()
+        if sid is not None
+    ]
+    if existing_users:
+        await send_json(ws, {"type": "user_list", "users": existing_users})
+
     if project_files.get(room):
         await send_json(ws, {
             "type": "project_init",
-            "host": room_host.get(room),
+            "host": host_sid,
             "files": project_files[room],
             "mode": room_mode.get(room, "readwrite"),
+            "session_start": room_start_time.get(room, time.time()),
         })
 
     for snap in file_snapshots.get(room, {}).values():
@@ -113,6 +133,7 @@ async def send_room_state(ws, room: str):
     for other_ws, fp in user_file_state.get(room, {}).items():
         if other_ws is not ws and fp is not None:
             await send_json(ws, fp)
+
 
 
 def compute_op_stats(room: str) -> tuple[dict[int, int], dict[int, int], dict[int, set]]:
@@ -430,6 +451,12 @@ async def handle_client(websocket):
             if t == "register":
                 sid = payload.get("siteId")
                 role = payload.get("role", "guest")
+
+                if role != "host" and room_host.get(room) is None:
+                    await send_json(websocket, {"type": "error", "message": "Room not found"})
+                    await websocket.close(1000, "room not found")
+                    break
+
                 room_users[room][websocket] = sid
                 if sid is not None:
                     room_user_joins[room][sid] = time.time()
@@ -438,6 +465,7 @@ async def handle_client(websocket):
                     room_avatars[room][sid] = payload.get("avatarUrl", "")
                 if role == "host":
                     room_host[room] = sid
+                    room_peer_roles.setdefault(room, {})[sid] = "host"
                     files = payload.get("files", [])
                     project_files[room] = files
                     room_mode[room] = payload.get("mode", "readwrite")
@@ -472,9 +500,13 @@ async def handle_client(websocket):
                 continue
 
             if t in ("insert", "delete", "undelete"):
+                sender_sid = room_users[room].get(websocket)
+                sender_role = room_peer_roles.get(room, {}).get(sender_sid, "write")
+                if sender_role == "read":
+                    continue
                 stored = dict(payload)
                 if t == "delete":
-                    stored["_actor"] = room_users[room].get(websocket)
+                    stored["_actor"] = sender_sid
                 file_history[room].setdefault(file_key, []).append(stored)
                 await broadcast(room, websocket, payload)
                 continue
@@ -534,14 +566,41 @@ async def handle_client(websocket):
                     final_file_states.setdefault(room, {}).update(files)
                 continue
 
-            if t in ("session_report_request", "end_session"):
+            if t == "role_change":
+                sender_sid = room_users[room].get(websocket)
+                if sender_sid is not None and sender_sid == room_host.get(room):
+                    target_sid = payload.get("siteId")
+                    new_role = payload.get("role", "write")
+                    if target_sid is not None:
+                        room_peer_roles.setdefault(room, {})[target_sid] = new_role
+                    await broadcast_all(room, payload)
+                continue
+
+            if t == "session_report_request":
                 await handle_session_report(room)
+                continue
+
+            if t == "end_session":
+                sender_sid = room_users[room].get(websocket)
+                is_sender_host = (sender_sid is not None and sender_sid == room_host.get(room))
+                if is_sender_host:
+                    await handle_session_report(room)
+                else:
+                    report = build_report(room)
+                    await send_json(websocket, {"type": "session_report", "data": report})
+                    async def _send_guest_ai(ws=websocket, r=report):
+                        text = await generate_ai_insights(r, room)
+                        if text:
+                            await send_json(ws, {"type": "session_report_ai", "data": {"text": text}})
+                    asyncio.create_task(_send_guest_ai())
                 continue
 
     except websockets.ConnectionClosed:
         pass
     finally:
         sid = room_users.get(room, {}).get(websocket)
+        is_host = (sid is not None and sid == room_host.get(room))
+
         rooms[room].discard(websocket)
         room_users[room].pop(websocket, None)
         cursor_state[room].pop(websocket, None)
@@ -551,15 +610,18 @@ async def handle_client(websocket):
             for d in (room_users, room_host, room_mode, room_usernames, room_avatars,
                       project_files, file_snapshots, file_history, cursor_state,
                       user_file_state, room_start_time, room_user_joins,
-                      final_file_states):
+                      final_file_states, room_peer_roles):
                 d.pop(room, None)
             del rooms[room]
+        elif is_host:
+            for ws in list(rooms[room]):
+                await send_json(ws, {"type": "session_ended"})
         else:
             await broadcast_user_list(room)
             if sid is not None:
                 await broadcast(room, None, {"type": "cursor_leave", "siteId": sid})
 
-        print(f"[LEAVE] room={room}")
+        print(f"[LEAVE] room={room} (host={is_host})")
 
 
 async def main():

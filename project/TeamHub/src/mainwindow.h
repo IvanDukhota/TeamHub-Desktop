@@ -3,8 +3,11 @@
 
 #include <QAction>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDockWidget>
+#include <QFrame>
 #include <QLabel>
+#include <QList>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QMap>
@@ -15,6 +18,8 @@
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QTabWidget>
+#include <QTimer>
+#include <QToolBar>
 #include <QToolButton>
 #include <QTreeWidget>
 
@@ -27,6 +32,7 @@
 #include "editor/codeeditor.h"
 #include "filebrowser/filebrowser.h"
 #include "git/gitpanel.h"
+#include "rga/rgamanager.h"
 #include "settings/settingsmanager.h"
 #include "team/teamspanel.h"
 #include "terminal/terminal.h"
@@ -44,6 +50,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
     void showEvent(QShowEvent *event) override;
     bool eventFilter(QObject *obj, QEvent *event) override;
+    bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
 
 private:
     //Activity Bar
@@ -61,6 +68,9 @@ private:
     QSplitter *centralSplitter;
 
     //Editor Area
+    QStackedWidget *editorStack = nullptr;
+    QWidget *welcomeWidget = nullptr;
+    QVBoxLayout *recentProjectsLayout = nullptr;
     QTabWidget *editorTabs;
     CodeEditor *editor;
 
@@ -93,9 +103,20 @@ private:
     QPushButton *btnSessionReport = nullptr;
     QWidget *collabNoSessionPane = nullptr;
     QWidget *collabInSessionPane = nullptr;
+    QLabel *sessionTimerLabel = nullptr;
+    QTimer *sessionTimer = nullptr;
+    QDateTime sessionStart;
+    QList<QWidget *> activeToasts;
+    QToolBar *mainToolBar = nullptr;
+    QTabWidget *editorTabs2 = nullptr;
+    QSplitter *editorSplitter = nullptr;
+    QTabWidget *focusedTabs = nullptr;
+    bool splitActive = false;
+    QList<QAction *> presenceActions;
     QMap<int, QString> peerFiles;
     QMap<int, QString> peerNames;
     QMap<int, QString> peerAvatars;
+    QMap<int, QString> peerRoles;
     QString currentCollabFile;
 
     // Session report
@@ -106,6 +127,9 @@ private:
     QProcess *runProcess = nullptr;
     QComboBox *runFileCombo = nullptr;
     QAction *actStop = nullptr;
+    QAction *actUndo = nullptr;
+    QAction *actRedo = nullptr;
+    QMap<CodeEditor *, RGAManager *> editorToMgr;
     int inputStartPos = 0;
 
     // Debug
@@ -131,6 +155,10 @@ private:
     void openProfileDialog();
     void updateCollabAccess();
 
+    void updateUndoRedoState();
+    void updateWelcomeVisibility();
+    void refreshWelcomeRecent();
+    void showToast(const QString &msg, const QString &type = {});
     void openSettings();
     void applySettings();
     void refreshRecentMenu(QMenu *menu);
@@ -149,6 +177,10 @@ private:
     void setupEditorArea();
     void setupBottomDock();
     void setupDebugPanel();
+    void openInSplitPanel(const QString &path, QTabWidget *sourcePanel);
+    void closeTabAt(QTabWidget *tabs, int index);
+    void showTabContextMenu(QTabWidget *tabs, const QPoint &pos);
+    QList<QTabWidget *> allTabWidgets() const;
     void setupStatusBar();
     void applyTheme();
 
@@ -170,7 +202,11 @@ private:
     void onCollabUsersUpdated(QMap<int, QString> users);
     void onRemoteFileFocusChanged(int siteId, const QString &file);
     void refreshCollabUsersList();
-    QWidget *makeCollabUserRow(int id, const QString &label, const QString &avatarUrl);
+    void refreshPresenceBar();
+    QWidget *makeCollabUserRow(int id,
+                               const QString &label,
+                               const QString &avatarUrl,
+                               const QString &role = {});
 
 private slots:
     void onActivityButton(int page);

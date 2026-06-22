@@ -26,27 +26,27 @@
 
 class AvatarRing : public QWidget
 {
-    QPixmap m_pix;
-    QColor m_ringColor;
-    int m_border;
+    QPixmap pix;
+    QColor ringColor;
+    int borderWidth;
 
 public:
     AvatarRing(int totalSize, int border, QWidget *parent = nullptr)
         : QWidget(parent)
-        , m_ringColor(Qt::transparent)
-        , m_border(border)
+        , ringColor(Qt::transparent)
+        , borderWidth(border)
     {
         setFixedSize(totalSize, totalSize);
         setAttribute(Qt::WA_TranslucentBackground);
     }
     void setPixmap(const QPixmap &p)
     {
-        m_pix = p;
+        pix = p;
         update();
     }
     void setRingColor(const QColor &c)
     {
-        m_ringColor = c;
+        ringColor = c;
         update();
     }
 
@@ -55,18 +55,18 @@ protected:
     {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        if (m_ringColor.alpha() > 0) {
-            p.setBrush(m_ringColor);
+        if (ringColor.alpha() > 0) {
+            p.setBrush(ringColor);
             p.setPen(Qt::NoPen);
             p.drawEllipse(rect());
         }
-        if (!m_pix.isNull()) {
-            const int d = m_border;
+        if (!pix.isNull()) {
+            const int d = borderWidth;
             const QRect r(d, d, width() - 2 * d, height() - 2 * d);
             QPainterPath path;
             path.addEllipse(r);
             p.setClipPath(path);
-            p.drawPixmap(r, m_pix.scaled(r.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
+            p.drawPixmap(r, pix.scaled(r.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
         }
     }
 };
@@ -250,18 +250,7 @@ QWidget *TeamsPanel::makeTeamsPage()
     vl->setContentsMargins(10, 10, 10, 10);
     vl->setSpacing(8);
 
-    auto *header = new QHBoxLayout;
-    header->addWidget(makeSectionLabel("MY TEAMS"));
-    header->addStretch(1);
-
-    btnNewTeam = new QPushButton("+");
-    btnNewTeam->setObjectName("voipBtn");
-    btnNewTeam->setFixedSize(26, 26);
-    btnNewTeam->setToolTip("Create a new team");
-    btnNewTeam->setEnabled(false);
-    connect(btnNewTeam, &QPushButton::clicked, this, &TeamsPanel::onNewTeamClicked);
-    header->addWidget(btnNewTeam);
-    vl->addLayout(header);
+    vl->addWidget(makeSectionLabel("MY TEAMS"));
 
     teamsList = new QListWidget;
     teamsList->setObjectName("teamList");
@@ -351,11 +340,22 @@ QWidget *TeamsPanel::makeDetailPage()
             &TeamsPanel::onRoomsContextMenu);
     rsl->addWidget(roomsList, 1);
 
-    roomsEmptyHint = new QLabel("No voice rooms yet.");
-    roomsEmptyHint->setObjectName("stubLabel");
-    roomsEmptyHint->setAlignment(Qt::AlignCenter);
-    roomsEmptyHint->setVisible(false);
-    rsl->addWidget(roomsEmptyHint);
+    roomsEmptyWidget = new QWidget;
+    auto *emptyLayout = new QVBoxLayout(roomsEmptyWidget);
+    emptyLayout->setContentsMargins(8, 12, 8, 12);
+    emptyLayout->setSpacing(8);
+    emptyLayout->setAlignment(Qt::AlignCenter);
+    auto *emptyLabel = new QLabel("No voice rooms yet.");
+    emptyLabel->setObjectName("stubLabel");
+    emptyLabel->setAlignment(Qt::AlignCenter);
+    emptyLayout->addWidget(emptyLabel);
+    btnCreateRoomEmpty = new QPushButton("Create Room");
+    btnCreateRoomEmpty->setObjectName("primaryBtn");
+    btnCreateRoomEmpty->setVisible(false);
+    connect(btnCreateRoomEmpty, &QPushButton::clicked, this, &TeamsPanel::onNewRoomClicked);
+    emptyLayout->addWidget(btnCreateRoomEmpty);
+    roomsEmptyWidget->setVisible(false);
+    rsl->addWidget(roomsEmptyWidget);
 
     splitter->addWidget(roomsSection);
     splitter->setStretchFactor(0, 1);
@@ -484,7 +484,6 @@ void TeamsPanel::refresh()
         return;
     }
 
-    btnNewTeam->setEnabled(true);
     teamManager->fetchMyTeams();
 
     if (pages->currentIndex() == 1 && !selectedTeamId.isEmpty())
@@ -496,7 +495,6 @@ void TeamsPanel::clear()
     teamsList->clear();
     selectedTeamId.clear();
     selectedTeamIsAdmin = false;
-    btnNewTeam->setEnabled(false);
     pages->setCurrentIndex(0);
     teamsEmptyHint->setText(auth && auth->isLoggedIn() ? "You have no teams yet — create one above."
                                                        : "Sign in to see your teams.");
@@ -535,7 +533,8 @@ void TeamsPanel::openTeamDetail(const QString &teamId, const QString &teamName)
     membersHeader->setText("MEMBERS");
     membersList->clear();
     roomsList->clear();
-    roomsEmptyHint->setVisible(false);
+    roomsEmptyWidget->setVisible(false);
+    btnCreateRoomEmpty->setVisible(false);
     btnNewRoom->setVisible(false);
 
     pages->setCurrentIndex(1);
@@ -627,7 +626,7 @@ QWidget *TeamsPanel::makeRoomRow(const TeamManager::RoomInfo &room)
     h->addLayout(textCol, 1);
 
     auto *btnJoin = new QPushButton("Join");
-    btnJoin->setObjectName("voipBtn");
+    btnJoin->setObjectName("primaryBtn");
     btnJoin->setFixedWidth(52);
     const QString roomKey = room.roomKey;
     const QString roomName = room.name;
@@ -702,28 +701,8 @@ void TeamsPanel::populateRooms(const QList<TeamManager::RoomInfo> &rooms)
 
     const bool empty = rooms.isEmpty();
     roomsList->setVisible(!empty);
-    roomsEmptyHint->setVisible(empty);
-}
-
-void TeamsPanel::onNewTeamClicked()
-{
-    if (!teamManager)
-        return;
-
-    bool ok = false;
-    const QString name
-        = QInputDialog::getText(this, "New Team", "Team name:", QLineEdit::Normal, QString(), &ok);
-    if (!ok || name.trimmed().isEmpty())
-        return;
-
-    const QString desc = QInputDialog::getText(this,
-                                               "New Team",
-                                               "Description (optional):",
-                                               QLineEdit::Normal,
-                                               QString(),
-                                               &ok);
-
-    teamManager->createTeam(name.trimmed(), ok ? desc.trimmed() : QString());
+    roomsEmptyWidget->setVisible(empty);
+    btnCreateRoomEmpty->setVisible(empty && selectedTeamIsAdmin);
 }
 
 void TeamsPanel::onNewRoomClicked()

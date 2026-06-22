@@ -2,16 +2,22 @@
 #define FILEBROWSER_H
 #include <QFileIconProvider>
 #include <QFileSystemModel>
+#include <QFileSystemWatcher>
 #include <QIcon>
 #include <QInputDialog>
 #include <QLineEdit>
+#include <QMap>
 #include <QMenu>
 #include <QMessageBox>
+#include <QProcess>
 #include <QPushButton>
 #include <QStackedWidget>
+#include <QStyledItemDelegate>
 #include <QTreeView>
 #include <QTreeWidget>
 #include <QWidget>
+
+class GitStatusDelegate;
 
 class FileBrowser : public QWidget
 {
@@ -25,6 +31,7 @@ public:
 
     void setRemoteFiles(const QStringList &relPaths);
     void revealFile(const QString &absolutePath);
+    void refreshGitStatus();
 
     void clearRemoteMode();
 
@@ -58,8 +65,14 @@ private:
 
     QString clipboardPath;
     bool isCut = false;
-    bool m_projectLoaded = false;
+    bool projectLoaded = false;
     QIcon pythonIcon;
+    QMap<QString, QIcon> extIcons;
+
+    QMap<QString, QChar> gitStatus;
+    QProcess *gitStatusProc = nullptr;
+    QFileSystemWatcher *gitWatcher = nullptr;
+    GitStatusDelegate *gitDelegate = nullptr;
 };
 
 #endif // FILEBROWSER_H

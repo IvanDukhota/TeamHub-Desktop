@@ -275,6 +275,13 @@ void CollabSession::onConnected()
 
 void CollabSession::onDisconnected()
 {
+    if (sessionEndedByServer) {
+        sessionEndedByServer = false;
+        emit disconnected();
+        return;
+    }
+    if (!wantReconnect)
+        return;
     emit disconnected();
     scheduleReconnect();
 }
@@ -314,8 +321,33 @@ void CollabSession::handleMessage(const QJsonObject &obj)
     const QString type = obj["type"].toString();
     const QString file = obj["file"].toString();
 
+    if (type == "error") {
+        wantReconnect = false;
+        reconnectTimer->stop();
+        emit errorOccurred(obj["message"].toString());
+        socket->close();
+        return;
+    }
+
+    if (type == "session_ended") {
+        wantReconnect = false;
+        reconnectTimer->stop();
+        sessionEndedByServer = true;
+        socket->close();
+        return;
+    }
+
     if (type == "kicked") {
         emit kicked();
+        return;
+    }
+
+    if (type == "role_change") {
+        const int targetSite = obj["siteId"].toInt();
+        const QString newRole = obj["role"].toString();
+        if (targetSite == currentSiteId)
+            mode = (newRole == "read") ? Mode::ReadOnly : Mode::ReadWrite;
+        emit peerRoleChanged(targetSite, newRole);
         return;
     }
 
@@ -336,6 +368,8 @@ void CollabSession::handleMessage(const QJsonObject &obj)
         files = receivedFiles;
         if (obj["mode"].toString() == "readonly")
             mode = Mode::ReadOnly;
+        if (obj.contains("session_start"))
+            startEpoch = static_cast<qint64>(obj["session_start"].toDouble());
         emit projectInitReceived(obj["host"].toInt(), receivedFiles);
         return;
     }
@@ -348,13 +382,18 @@ void CollabSession::handleMessage(const QJsonObject &obj)
     if (type == "user_list") {
         QMap<int, QString> users;
         QMap<int, QString> avatars;
+        QMap<int, QString> roles;
         for (const QJsonValue &v : obj["users"].toArray()) {
             const QJsonObject u = v.toObject();
             const int sid = u["siteId"].toInt();
             users[sid] = u["username"].toString();
             avatars[sid] = u["avatarUrl"].toString();
+            if (u.contains("role"))
+                roles[sid] = u["role"].toString();
         }
         peerAvatars = avatars;
+        if (!roles.isEmpty())
+            emit rolesUpdated(roles);
         emit usersUpdated(users);
         return;
     }
@@ -462,6 +501,11 @@ void CollabSession::sendMessage(const QJsonObject &msg)
 {
     if (!isConnected())
         return;
+    if (mode == Mode::ReadOnly) {
+        const QString t = msg["type"].toString();
+        if (t == "insert" || t == "delete")
+            return;
+    }
     socket->sendTextMessage(QJsonDocument(msg).toJson(QJsonDocument::Compact));
 }
 
@@ -470,6 +514,15 @@ void CollabSession::kickUser(int siteId)
     QJsonObject msg;
     msg["type"] = "kick";
     msg["siteId"] = siteId;
+    sendMessage(msg);
+}
+
+void CollabSession::sendRoleChange(int targetSiteId, const QString &role)
+{
+    QJsonObject msg;
+    msg["type"] = "role_change";
+    msg["siteId"] = targetSiteId;
+    msg["role"] = role;
     sendMessage(msg);
 }
 

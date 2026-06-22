@@ -68,6 +68,7 @@ void RGAManager::localInsert(int bytePos, QChar ch)
         undoStack.push({op});
     }
     redoStack.clear();
+    notifyUndoState();
 
     QJsonObject msg;
     msg["type"] = "insert";
@@ -100,6 +101,7 @@ void RGAManager::localRemove(int bytePos)
         undoStack.push({op});
     }
     redoStack.clear();
+    notifyUndoState();
 
     QJsonObject msg;
     msg["type"] = "delete";
@@ -242,6 +244,12 @@ void RGAManager::sendCursorPosition(int scintillaPos)
     sendMessage(msg);
 }
 
+void RGAManager::notifyUndoState()
+{
+    emit undoAvailableChanged(!undoStack.isEmpty());
+    emit redoAvailableChanged(!redoStack.isEmpty());
+}
+
 void RGAManager::beginGroup()
 {
     grouping = true;
@@ -254,6 +262,7 @@ void RGAManager::endGroup()
     if (!pendingGroup.isEmpty()) {
         undoStack.push(pendingGroup);
         pendingGroup.clear();
+        notifyUndoState();
     }
 }
 
@@ -287,6 +296,7 @@ void RGAManager::undo()
     }
 
     redoStack.push(reverseGroup);
+    notifyUndoState();
     emit remoteTextChanged(sequence.toText());
 }
 
@@ -315,6 +325,7 @@ void RGAManager::redo()
     }
 
     undoStack.push(reverseGroup);
+    notifyUndoState();
     emit remoteTextChanged(sequence.toText());
 }
 

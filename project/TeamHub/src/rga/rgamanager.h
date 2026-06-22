@@ -31,6 +31,8 @@ public:
 
     int getSiteId() const { return siteId; }
     QString getFilePath() const { return filePath; }
+    bool canUndo() const { return !undoStack.isEmpty(); }
+    bool canRedo() const { return !redoStack.isEmpty(); }
 
     RGASequence getSequence() const { return sequence; }
     void setSequence(const RGASequence &seq) { sequence = seq; }
@@ -53,12 +55,15 @@ public slots:
 signals:
     void textChanged(const QString &newText);
     void remoteTextChanged(const QString &newText);
+    void undoAvailableChanged(bool available);
+    void redoAvailableChanged(bool available);
     void onInitReceived(QString text, QString filename);
     void remoteCursorMoved(int siteId, int position);
     void remoteCursorLeft(int siteId);
     void usersUpdated(QList<int> siteIds);
 
 private:
+    void notifyUndoState();
     void processMessage(const QJsonObject &obj);
     void remoteInsert(const RGANode &node);
     void remoteDelete(const RGAId &id);

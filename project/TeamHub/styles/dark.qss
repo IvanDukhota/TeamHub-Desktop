@@ -331,6 +331,28 @@ QPushButton#voipBtn:hover   { background: #505050; }
 QPushButton#voipBtn:pressed { background: #007acc; }
 QPushButton#voipBtn:disabled { color: #555555; }
 QPushButton#voipBtn:checked { background: #007acc; }
+
+QPushButton#primaryBtn {
+    background: #0e639c;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 7px 18px;
+}
+QPushButton#primaryBtn:hover    { background: #1177bb; }
+QPushButton#primaryBtn:pressed  { background: #0a4f7e; }
+QPushButton#primaryBtn:disabled { background: #2d2d2d; color: #666666; border: none; }
+
+QPushButton#dangerBtn {
+    background: #c72e2e;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 7px 18px;
+}
+QPushButton#dangerBtn:hover   { background: #e04040; }
+QPushButton#dangerBtn:pressed { background: #9e2020; }
+
 QWidget#callBanner {
     background: #1e3329;
     border-bottom: 1px solid #2d5a3d;
@@ -489,3 +511,54 @@ QStatusBar {
 }
 QStatusBar::item { border: none; }
 QLabel#statusLabel { color: #ffffff; padding: 0 4px; }
+
+QWidget#welcomeWidget {
+    background: #1e1e1e;
+}
+QLabel#welcomeTitle {
+    color: #d4d4d4;
+    font-size: 30px;
+    font-weight: bold;
+    padding-bottom: 2px;
+}
+QLabel#welcomeSubtitle {
+    color: #6a6a6a;
+    font-size: 12px;
+}
+QLabel#welcomeSectionHeader {
+    color: #555555;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 1.5px;
+}
+QFrame#welcomeRecentRow {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+QFrame#welcomeRecentRow:hover {
+    background: #2a2d2e;
+    border: 1px solid #3c3c3c;
+}
+QLabel#welcomeRecentName {
+    color: #cccccc;
+    font-size: 13px;
+}
+QLabel#welcomeRecentPath {
+    color: #6a6a6a;
+    font-size: 11px;
+}
+QLabel#welcomeShortcuts {
+    color: #858585;
+    font-size: 12px;
+}
+QPushButton#welcomeOpenFile {
+    background: #0e639c;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-size: 12px;
+}
+QPushButton#welcomeOpenFile:hover   { background: #1177bb; }
+QPushButton#welcomeOpenFile:pressed { background: #0a4f7e; }

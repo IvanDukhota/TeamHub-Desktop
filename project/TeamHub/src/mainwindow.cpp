@@ -16,6 +16,7 @@
 #include <QButtonGroup>
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -35,16 +36,19 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPixmap>
+#include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
 #include <QRandomGenerator>
 #include <QSizePolicy>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QTabBar>
 #include <QTimer>
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QVBoxLayout>
+#include <QWidgetAction>
 #include <functional>
 
 static QIcon loadIconTransparent(const QString &name, bool removeDark = false)
@@ -56,6 +60,7 @@ static QIcon loadIconTransparent(const QString &name, bool removeDark = false)
     if (img.isNull())
         return QIcon();
     img = img.convertToFormat(QImage::Format_ARGB32);
+
     for (int y = 0; y < img.height(); ++y)
         for (int x = 0; x < img.width(); ++x) {
             const QColor c(img.pixel(x, y));
@@ -64,6 +69,7 @@ static QIcon loadIconTransparent(const QString &name, bool removeDark = false)
             if (isLight || isDark)
                 img.setPixel(x, y, qRgba(0, 0, 0, 0));
         }
+
     return QIcon(QPixmap::fromImage(img));
 }
 
@@ -126,6 +132,15 @@ MainWindow::MainWindow(QWidget *parent)
     setupStatusBar();
     applyTheme();
 
+    connect(qApp, &QApplication::focusChanged, this, [this](QWidget *, QWidget *now) {
+        if (!now || !splitActive)
+            return;
+        if (editorTabs->isAncestorOf(now))
+            focusedTabs = editorTabs;
+        else if (editorTabs2 && editorTabs2->isAncestorOf(now))
+            focusedTabs = editorTabs2;
+    });
+
     connect(teamsPanel, &TeamsPanel::logMessage, outputPane, &QPlainTextEdit::appendPlainText);
     teamsPanel->setVoiceChat(voiceChat);
 
@@ -134,9 +149,12 @@ MainWindow::MainWindow(QWidget *parent)
 
     setSidePanelPage(0);
     btnFiles->setChecked(true);
-    connect(editorTabs, &QTabWidget::currentChanged, this, &MainWindow::onTabChanged);
     connect(editorTabs, &QTabWidget::currentChanged, this, [this] { updateRunCombo(); });
+    connect(editorTabs2, &QTabWidget::currentChanged, this, [this] { updateRunCombo(); });
     connect(editorTabs, &QTabWidget::tabCloseRequested, this, [this] {
+        QTimer::singleShot(0, this, &MainWindow::updateRunCombo);
+    });
+    connect(editorTabs2, &QTabWidget::tabCloseRequested, this, [this] {
         QTimer::singleShot(0, this, &MainWindow::updateRunCombo);
     });
     outputPane->appendPlainText("[TeamHub] Ready.");
@@ -171,6 +189,11 @@ void MainWindow::showEvent(QShowEvent *event)
     const COLORREF captionColor = RGB(0x1e, 0x1e, 0x1e);
     DwmSetWindowAttribute(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &captionColor, sizeof(captionColor));
 #endif
+}
+
+bool MainWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr *result)
+{
+    return QMainWindow::nativeEvent(eventType, message, result);
 }
 
 bool MainWindow::eventFilter(QObject *obj, QEvent *event)
@@ -216,6 +239,20 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
             }
         }
     }
+    if (event->type() == QEvent::MouseButtonPress) {
+        const QString path = obj->property("recentPath").toString();
+        if (!path.isEmpty()) {
+            if (QFileInfo::exists(path))
+                openProjectFolder(path);
+            else {
+                ProjectDB::instance().removeProject(path);
+                outputPane->appendPlainText("[TeamHub] Project not found: " + path);
+                refreshWelcomeRecent();
+            }
+            return true;
+        }
+    }
+
     return QMainWindow::eventFilter(obj, event);
 }
 
@@ -247,10 +284,16 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 CodeEditor *MainWindow::createTab(const QString &name)
 {
-    CodeEditor *ed = new CodeEditor(editorTabs);
+    QTabWidget *target = focusedTabs ? focusedTabs : editorTabs;
+    CodeEditor *ed = new CodeEditor(target);
     connect(ed, &CodeEditor::cursorPositionUpdated, this, &MainWindow::onCursorPositionUpdated);
     connect(ed, &CodeEditor::modifyChanged, this, &MainWindow::onModificationChanged);
-    editorTabs->addTab(ed, name);
+    connect(ed, &CodeEditor::fileModified, this, [this, ed] {
+        if (editor == ed)
+            updateUndoRedoState();
+    });
+    target->addTab(ed, name);
+
     return ed;
 }
 
@@ -264,7 +307,37 @@ void MainWindow::setupMenuBar()
     fileMenu->addAction("Save &As...", QKeySequence::SaveAs, this, [this] { saveFileAs(); });
     fileMenu->addSeparator();
     fileMenu->addAction("Close &Tab", QKeySequence("Ctrl+W"), this, [this] {
-        onTabCloseRequested(editorTabs->currentIndex());
+        QTabWidget *tabs = focusedTabs ? focusedTabs : editorTabs;
+        const int idx = tabs->currentIndex();
+        if (idx < 0)
+            return;
+        CodeEditor *ed = qobject_cast<CodeEditor *>(tabs->widget(idx));
+        if (!ed)
+            return;
+        if (session) {
+            const QString relPath = toSessionKey(ed->getFilePath());
+            if (session->hasActiveRGA(relPath)) {
+                ed->clearRemoteCursors();
+                session->releaseRGA(relPath);
+            }
+            markTabAsCollab(ed, false);
+        }
+        if (ed->isModified() && !(session && session->role() == CollabSession::Role::Guest)) {
+            const auto btn = QMessageBox::question(this,
+                                                   "Unsaved Changes",
+                                                   "Save changes before closing this tab?",
+                                                   QMessageBox::Save | QMessageBox::Discard
+                                                       | QMessageBox::Cancel);
+            if (btn == QMessageBox::Save) {
+                editor = ed;
+                if (!saveFile())
+                    return;
+            } else if (btn == QMessageBox::Cancel) {
+                return;
+            }
+        }
+        tabs->removeTab(idx);
+        ed->deleteLater();
     });
     fileMenu->addSeparator();
 
@@ -307,12 +380,11 @@ void MainWindow::setupMenuBar()
     editMenu->addSeparator();
     auto *actFind = editMenu->addAction("&Find / Replace...", QKeySequence("Ctrl+F"));
     connect(actFind, &QAction::triggered, this, [this]() {
-        CodeEditor *ed = qobject_cast<CodeEditor *>(editorTabs->currentWidget());
+        QTabWidget *activeTabs = focusedTabs ? focusedTabs : editorTabs;
+        CodeEditor *ed = qobject_cast<CodeEditor *>(activeTabs->currentWidget());
         if (ed)
             ed->showSearch();
     });
-    auto *actGoto = editMenu->addAction("&Go to Line...", QKeySequence("Ctrl+G"));
-    actGoto->setEnabled(false);
 
     QMenu *viewMenu = menuBar()->addMenu("&View");
     viewMenu->addAction("Toggle &Side Panel",
@@ -324,6 +396,13 @@ void MainWindow::setupMenuBar()
                         this,
                         &MainWindow::toggleBottomDock);
     viewMenu->addAction("Toggle &Team Panel", {}, this, [this] { onActivityButton(2); });
+    viewMenu->addSeparator();
+    viewMenu->addAction("Split Editor Right", QKeySequence("Ctrl+\\"), this, [this] {
+        QTabWidget *source = focusedTabs ? focusedTabs : editorTabs;
+        CodeEditor *ed = qobject_cast<CodeEditor *>(source->currentWidget());
+        if (ed && !ed->getFilePath().isEmpty())
+            openInSplitPanel(ed->getFilePath(), source);
+    });
     viewMenu->addSeparator();
     viewMenu->addAction("Zoom &In", QKeySequence::ZoomIn, this, [this] {
         if (editor)
@@ -424,14 +503,13 @@ void MainWindow::setupMenuBar()
     QMenu *teamMenu = menuBar()->addMenu("&Team");
     teamMenu->addAction("Connect to Server", this, &MainWindow::joinCollab);
     teamMenu->addSeparator();
-    teamMenu->addAction("Members")->setEnabled(false);
-    teamMenu->addAction("Share Session")->setEnabled(false);
     teamMenu->addAction("Voice Call", this, [this] { onActivityButton(2); });
 }
 
 void MainWindow::setupMainToolBar()
 {
-    auto *tb = addToolBar("Main");
+    mainToolBar = addToolBar("Main");
+    auto *tb = mainToolBar;
     tb->setObjectName("mainToolBar");
     tb->setMovable(false);
     tb->setIconSize(QSize(16, 16));
@@ -446,21 +524,25 @@ void MainWindow::setupMainToolBar()
 
     tb->addSeparator();
 
-    auto *actUndo = tb->addAction("Undo", this, [this] {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->currentWidget()))
+    actUndo = tb->addAction("Undo", this, [this] {
+        if (auto *ed = qobject_cast<CodeEditor *>(
+                (focusedTabs ? focusedTabs : editorTabs)->currentWidget()))
             ed->undo();
     });
     actUndo->setIcon(loadIconTransparent("undo.png"));
     actUndo->setToolTip("Undo (Ctrl+Z)");
     actUndo->setShortcut(QKeySequence::Undo);
+    actUndo->setEnabled(false);
 
-    auto *actRedo = tb->addAction("Redo", this, [this] {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->currentWidget()))
+    actRedo = tb->addAction("Redo", this, [this] {
+        if (auto *ed = qobject_cast<CodeEditor *>(
+                (focusedTabs ? focusedTabs : editorTabs)->currentWidget()))
             ed->redo();
     });
     actRedo->setIcon(loadIconTransparent("redo.png"));
     actRedo->setToolTip("Redo (Ctrl+Y)");
     actRedo->setShortcut(QKeySequence::Redo);
+    actRedo->setEnabled(false);
 
     tb->addSeparator();
 
@@ -494,6 +576,10 @@ void MainWindow::setupMainToolBar()
                                "QToolButton:disabled { color:#5a2020; }");
         }
     });
+
+    auto *spacer = new QWidget;
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    tb->addWidget(spacer);
 }
 
 void MainWindow::startCollab(const QString &room,
@@ -529,17 +615,19 @@ void MainWindow::startCollab(const QString &room,
             fileTexts[relPath] = QString::fromUtf8(f.readAll());
     }
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
-        if (!ed || ed->getFilePath().isEmpty())
-            continue;
-        const QString absPath = ed->getFilePath();
-        if (!absPath.startsWith(projectRoot))
-            continue;
-        const QString relPath = QDir(projectRoot).relativeFilePath(absPath);
-        if (!allRelPaths.contains(relPath))
-            allRelPaths.append(relPath);
-        fileTexts[relPath] = ed->text();
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i));
+            if (!ed || ed->getFilePath().isEmpty())
+                continue;
+            const QString absPath = ed->getFilePath();
+            if (!absPath.startsWith(projectRoot))
+                continue;
+            const QString relPath = QDir(projectRoot).relativeFilePath(absPath);
+            if (!allRelPaths.contains(relPath))
+                allRelPaths.append(relPath);
+            fileTexts[relPath] = ed->text();
+        }
     }
 
     if (!selectedFiles.isEmpty()) {
@@ -557,18 +645,24 @@ void MainWindow::startCollab(const QString &room,
 
     session->setProject(projectRoot, allRelPaths);
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
-        if (!ed || ed->getFilePath().isEmpty())
-            continue;
-        const QString absPath = ed->getFilePath();
-        if (!absPath.startsWith(projectRoot))
-            continue;
-        const QString relPath = QDir(projectRoot).relativeFilePath(absPath);
-        wireEditorToSession(ed, relPath);
-        markTabAsCollab(ed, true);
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i));
+            if (!ed || ed->getFilePath().isEmpty())
+                continue;
+            const QString absPath = ed->getFilePath();
+            if (!absPath.startsWith(projectRoot))
+                continue;
+            const QString relPath = QDir(projectRoot).relativeFilePath(absPath);
+            wireEditorToSession(ed, relPath);
+            markTabAsCollab(ed, true);
+        }
     }
 
+    connect(session, &CollabSession::rolesUpdated, this, [this](QMap<int, QString> roles) {
+        for (auto it = roles.cbegin(); it != roles.cend(); ++it)
+            peerRoles[it.key()] = it.value();
+    });
     connect(session, &CollabSession::usersUpdated, this, &MainWindow::onCollabUsersUpdated);
     connect(session, &CollabSession::projectInitReceived, this, &MainWindow::onSessionProjectInit);
     connect(session, &CollabSession::runOutputReceived, this, &MainWindow::onSessionRunOutput);
@@ -584,6 +678,22 @@ void MainWindow::startCollab(const QString &room,
             &CollabSession::sessionAiInsightsReady,
             this,
             &MainWindow::onSessionAiInsightsReady);
+    connect(session, &CollabSession::peerRoleChanged, this, [this](int siteId, const QString &role) {
+        peerRoles[siteId] = role;
+        refreshCollabUsersList();
+        if (session && siteId == session->siteId()) {
+            outputPane->appendPlainText(QString("[Collab] Your role changed to: ")
+                                        + (role == "read" ? "Read-only" : "Write"));
+            const bool ro = (role == "read");
+            for (QTabWidget *tabs : allTabWidgets()) {
+                for (int i = 0; i < tabs->count(); ++i) {
+                    if (auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i)))
+                        if (ed->collabActive)
+                            ed->setReadOnly(ro);
+                }
+            }
+        }
+    });
     connect(session, &CollabSession::errorOccurred, this, [this](const QString &err) {
         outputPane->appendPlainText("[Collab] Error: " + err);
     });
@@ -617,6 +727,20 @@ void MainWindow::startCollab(const QString &room,
                 collabNoSessionPane->hide();
             if (collabInSessionPane)
                 collabInSessionPane->show();
+            sessionStart = QDateTime::currentDateTime();
+            if (!sessionTimer) {
+                sessionTimer = new QTimer(this);
+                connect(sessionTimer, &QTimer::timeout, this, [this]() {
+                    const qint64 s = sessionStart.secsTo(QDateTime::currentDateTime());
+                    if (sessionTimerLabel)
+                        sessionTimerLabel->setText(QString("%1:%2:%3")
+                                                       .arg(s / 3600, 2, 10, QChar('0'))
+                                                       .arg((s % 3600) / 60, 2, 10, QChar('0'))
+                                                       .arg(s % 60, 2, 10, QChar('0')));
+                });
+            }
+            sessionTimer->start(1000);
+            showToast("Collab session started", "success");
             const QString path = editor ? editor->getFilePath() : QString();
             if (!path.isEmpty()) {
                 const QString relPath = toSessionKey(path);
@@ -624,6 +748,7 @@ void MainWindow::startCollab(const QString &room,
                 session->sendFileFocus(relPath);
                 peerFiles[session->siteId()] = relPath;
                 refreshCollabUsersList();
+                refreshPresenceBar();
             }
         },
         Qt::SingleShotConnection);
@@ -655,6 +780,10 @@ void MainWindow::joinCollab()
         session->setAvatarUrl(auth->currentUser().avatarUrl);
     }
 
+    connect(session, &CollabSession::rolesUpdated, this, [this](QMap<int, QString> roles) {
+        for (auto it = roles.cbegin(); it != roles.cend(); ++it)
+            peerRoles[it.key()] = it.value();
+    });
     connect(session, &CollabSession::projectInitReceived, this, &MainWindow::onSessionProjectInit);
     connect(session, &CollabSession::runOutputReceived, this, &MainWindow::onSessionRunOutput);
     connect(session, &CollabSession::usersUpdated, this, &MainWindow::onCollabUsersUpdated);
@@ -670,8 +799,31 @@ void MainWindow::joinCollab()
             &CollabSession::sessionAiInsightsReady,
             this,
             &MainWindow::onSessionAiInsightsReady);
-    connect(session, &CollabSession::errorOccurred, this, [this](const QString &err) {
+    connect(session, &CollabSession::peerRoleChanged, this, [this](int siteId, const QString &role) {
+        peerRoles[siteId] = role;
+        refreshCollabUsersList();
+        if (session && siteId == session->siteId()) {
+            outputPane->appendPlainText(QString("[Collab] Your role changed to: ")
+                                        + (role == "read" ? "Read-only" : "Write"));
+            const bool ro = (role == "read");
+            for (QTabWidget *tabs : allTabWidgets()) {
+                for (int i = 0; i < tabs->count(); ++i) {
+                    if (auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i)))
+                        if (ed->collabActive)
+                            ed->setReadOnly(ro);
+                }
+            }
+        }
+    });
+    connect(session, &CollabSession::errorOccurred, this, [this, room](const QString &err) {
         outputPane->appendPlainText("[Collab] Error: " + err);
+        QTimer::singleShot(0, this, [this, room, err]() {
+            stopAllCollab();
+            if (err == "Room not found")
+                QMessageBox::warning(this,
+                                     "Join Collab",
+                                     QString("Room \"%1\" does not exist.").arg(room));
+        });
     });
     connect(session, &CollabSession::reconnecting, this, [this](int attempt, int maxAttempts) {
         const int delayS = 1 << (attempt - 1);
@@ -709,6 +861,20 @@ void MainWindow::joinCollab()
                 collabNoSessionPane->hide();
             if (collabInSessionPane)
                 collabInSessionPane->show();
+            sessionStart = QDateTime::currentDateTime();
+            if (!sessionTimer) {
+                sessionTimer = new QTimer(this);
+                connect(sessionTimer, &QTimer::timeout, this, [this]() {
+                    const qint64 s = sessionStart.secsTo(QDateTime::currentDateTime());
+                    if (sessionTimerLabel)
+                        sessionTimerLabel->setText(QString("%1:%2:%3")
+                                                       .arg(s / 3600, 2, 10, QChar('0'))
+                                                       .arg((s % 3600) / 60, 2, 10, QChar('0'))
+                                                       .arg(s % 60, 2, 10, QChar('0')));
+                });
+            }
+            sessionTimer->start(1000);
+            showToast("Joined collab session", "success");
         },
         Qt::SingleShotConnection);
 
@@ -725,6 +891,16 @@ void MainWindow::wireEditorToManager(CodeEditor *ed, RGAManager *mgr)
     connect(ed, &CodeEditor::beginUndoGroup, mgr, &RGAManager::beginGroup, Qt::UniqueConnection);
     connect(ed, &CodeEditor::endUndoGroup, mgr, &RGAManager::endGroup, Qt::UniqueConnection);
     ed->collabActive = true;
+
+    editorToMgr[ed] = mgr;
+    connect(mgr, &RGAManager::undoAvailableChanged, this, [this, ed](bool) {
+        if (editor == ed)
+            updateUndoRedoState();
+    });
+    connect(mgr, &RGAManager::redoAvailableChanged, this, [this, ed](bool) {
+        if (editor == ed)
+            updateUndoRedoState();
+    });
 
     connect(mgr, &RGAManager::remoteTextChanged, ed, [ed](const QString &newText) {
         ed->applyRemoteText(newText);
@@ -780,15 +956,17 @@ QMap<QString, QString> MainWindow::collectCurrentFileTexts() const
 
     const QString root = session->projectRoot();
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        const auto *ed = qobject_cast<const CodeEditor *>(editorTabs->widget(i));
-        if (!ed)
-            continue;
-        const QString abs = ed->getFilePath();
-        if (abs.isEmpty())
-            continue;
-        const QString rel = root.isEmpty() ? abs : QDir(root).relativeFilePath(abs);
-        texts[rel] = ed->text();
+    for (const QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            const auto *ed = qobject_cast<const CodeEditor *>(tabs->widget(i));
+            if (!ed)
+                continue;
+            const QString abs = ed->getFilePath();
+            if (abs.isEmpty())
+                continue;
+            const QString rel = root.isEmpty() ? abs : QDir(root).relativeFilePath(abs);
+            texts[rel] = ed->text();
+        }
     }
 
     for (const QString &f : session->fileList())
@@ -807,21 +985,25 @@ void MainWindow::stopAllCollab()
     const bool isGuest = (session->role() == CollabSession::Role::Guest);
 
     if (isGuest) {
-        for (int i = editorTabs->count() - 1; i >= 0; --i) {
-            auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
-            if (ed && ed->collabActive) {
-                editorTabs->removeTab(i);
-                ed->deleteLater();
+        for (QTabWidget *tabs : allTabWidgets()) {
+            for (int i = tabs->count() - 1; i >= 0; --i) {
+                auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i));
+                if (ed && ed->collabActive) {
+                    tabs->removeTab(i);
+                    ed->deleteLater();
+                }
             }
         }
     } else {
-        for (int i = 0; i < editorTabs->count(); ++i) {
-            auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
-            if (!ed)
-                continue;
-            ed->clearRemoteCursors();
-            ed->collabActive = false;
-            markTabAsCollab(ed, false);
+        for (QTabWidget *tabs : allTabWidgets()) {
+            for (int i = 0; i < tabs->count(); ++i) {
+                auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i));
+                if (!ed)
+                    continue;
+                ed->clearRemoteCursors();
+                ed->collabActive = false;
+                markTabAsCollab(ed, false);
+            }
         }
     }
 
@@ -832,7 +1014,9 @@ void MainWindow::stopAllCollab()
     peerFiles.clear();
     peerNames.clear();
     peerAvatars.clear();
+    peerRoles.clear();
     currentCollabFile.clear();
+    refreshPresenceBar();
 
     if (collabUsersList)
         collabUsersList->clear();
@@ -842,6 +1026,11 @@ void MainWindow::stopAllCollab()
         collabNoSessionPane->show();
     if (collabInSessionPane)
         collabInSessionPane->hide();
+    if (sessionTimer)
+        sessionTimer->stop();
+    if (sessionTimerLabel)
+        sessionTimerLabel->setText("00:00:00");
+    showToast("Collab session ended", "info");
 
     fileBrowser->clearRemoteMode();
 
@@ -850,18 +1039,22 @@ void MainWindow::stopAllCollab()
 
 void MainWindow::markTabAsCollab(CodeEditor *ed, bool on)
 {
-    const int idx = editorTabs->indexOf(ed);
-    if (idx < 0)
-        return;
-
-    QString name = QFileInfo(ed->getFilePath()).fileName();
-    if (name.isEmpty())
-        name = "Untitled";
-
-    editorTabs->setTabText(idx, on ? (QString::fromUtf8("◎ ") + name) : name);
+    for (QTabWidget *tabs : allTabWidgets()) {
+        const int idx = tabs->indexOf(ed);
+        if (idx >= 0) {
+            QString name = QFileInfo(ed->getFilePath()).fileName();
+            if (name.isEmpty())
+                name = "Untitled";
+            tabs->setTabText(idx, on ? (QString::fromUtf8("◎ ") + name) : name);
+            return;
+        }
+    }
 }
 
-QWidget *MainWindow::makeCollabUserRow(int id, const QString &label, const QString &avatarUrl)
+QWidget *MainWindow::makeCollabUserRow(int id,
+                                       const QString &label,
+                                       const QString &avatarUrl,
+                                       const QString &role)
 {
     auto *row = new QWidget;
     row->setStyleSheet("background: transparent;");
@@ -884,6 +1077,14 @@ QWidget *MainWindow::makeCollabUserRow(int id, const QString &label, const QStri
     nameLbl->setStyleSheet("color: #d4d4d4; font-size: 12px;");
     h->addWidget(nameLbl, 1);
 
+    if (!role.isEmpty()) {
+        const QString label_ = (role == "host") ? "Host" : (role == "write" ? "Write" : "Read");
+        auto *pill = new QLabel(label_);
+        pill->setStyleSheet("background: #3c3c3c; color: #aaaaaa; border-radius: 8px; "
+                            "padding: 1px 8px; font-size: 10px;");
+        h->addWidget(pill);
+    }
+
     return row;
 }
 
@@ -905,26 +1106,62 @@ void MainWindow::refreshCollabUsersList()
         item->setSizeHint(QSize(0, 32));
         item->setData(Qt::UserRole, id);
         collabUsersList->addItem(item);
-        collabUsersList->setItemWidget(item, makeCollabUserRow(id, label, peerAvatars.value(id)));
+        collabUsersList->setItemWidget(item,
+                                       makeCollabUserRow(id,
+                                                         label,
+                                                         peerAvatars.value(id),
+                                                         peerRoles.value(id)));
     }
 }
 
 void MainWindow::onCollabUsersUpdated(QMap<int, QString> users)
 {
+    const QMap<int, QString> prevNames = peerNames;
     peerNames = users;
     if (session)
         peerAvatars = session->avatars();
-    refreshCollabUsersList();
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i)))
-            for (auto it = users.cbegin(); it != users.cend(); ++it)
-                ed->setRemotePeerName(it.key(), it.value());
+    for (auto it = users.cbegin(); it != users.cend(); ++it) {
+        const int id = it.key();
+        if (!peerRoles.contains(id)) {
+            if (session && id == session->siteId() && session->role() == CollabSession::Role::Host)
+                peerRoles[id] = "host";
+            else
+                peerRoles[id] = (session && session->collabMode() == CollabSession::Mode::ReadOnly)
+                                    ? "read"
+                                    : "write";
+        }
+    }
+    for (auto it = peerRoles.begin(); it != peerRoles.end();)
+        it = users.contains(it.key()) ? ++it : peerRoles.erase(it);
+    for (auto it = peerFiles.begin(); it != peerFiles.end();)
+        it = users.contains(it.key()) ? ++it : peerFiles.erase(it);
+
+    refreshCollabUsersList();
+    refreshPresenceBar();
+
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            if (auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i)))
+                for (auto it = users.cbegin(); it != users.cend(); ++it)
+                    ed->setRemotePeerName(it.key(), it.value());
+        }
     }
     if (collabStatusLabel && !users.isEmpty()) {
         const QString role = (session && session->role() == CollabSession::Role::Host) ? "Hosting"
                                                                                        : "Guest";
         collabStatusLabel->setText(QString("%1 — %2 user(s)").arg(role).arg(users.size()));
+    }
+
+    if (!prevNames.isEmpty()) {
+        for (auto it = users.cbegin(); it != users.cend(); ++it) {
+            if (!prevNames.contains(it.key()))
+                showToast(it.value() + " joined", "success");
+        }
+        for (auto it = prevNames.cbegin(); it != prevNames.cend(); ++it) {
+            if (!users.contains(it.key()))
+                showToast(it.value() + " left", "info");
+        }
     }
 }
 
@@ -932,40 +1169,70 @@ void MainWindow::onRemoteFileFocusChanged(int siteId, const QString &file)
 {
     peerFiles[siteId] = file;
     refreshCollabUsersList();
+    refreshPresenceBar();
+}
+
+void MainWindow::refreshPresenceBar()
+{
+    if (!mainToolBar)
+        return;
+
+    for (QAction *a : presenceActions)
+        mainToolBar->removeAction(a);
+    qDeleteAll(presenceActions);
+    presenceActions.clear();
+
+    if (!session || !session->isConnected() || currentCollabFile.isEmpty())
+        return;
+
+    QList<int> onFile;
+    for (auto it = peerFiles.cbegin(); it != peerFiles.cend(); ++it)
+        if (it.value() == currentCollabFile)
+            onFile.append(it.key());
+
+    if (onFile.isEmpty())
+        return;
+
+    constexpr int S = 26;
+    constexpr int inner = 22;
+
+    for (const int id : onFile) {
+        const QString name = (id == session->siteId())
+                                 ? (auth ? auth->currentUser().username : QString("You"))
+                                 : peerNames.value(id, QString("user_%1").arg(id));
+        const QString url = (id == session->siteId())
+                                ? (auth ? auth->currentUser().avatarUrl : QString())
+                                : peerAvatars.value(id);
+
+        auto *lbl = new QLabel(mainToolBar);
+        lbl->setFixedSize(S, S);
+        lbl->setToolTip(name);
+        lbl->setAlignment(Qt::AlignCenter);
+
+        const QPixmap fallback = Avatar::letterPixmap(Avatar::initialFor(name),
+                                                      Avatar::colorForId(QString::number(id)),
+                                                      inner);
+        lbl->setPixmap(Avatar::circularPixmap(fallback, S));
+
+        QPointer<QLabel> ptr = lbl;
+        Avatar::load(lbl, url, fallback, inner, [ptr](const QPixmap &pix) {
+            if (ptr)
+                ptr->setPixmap(Avatar::circularPixmap(pix, 26));
+        });
+
+        auto *act = new QWidgetAction(mainToolBar);
+        act->setDefaultWidget(lbl);
+        mainToolBar->addAction(act);
+        presenceActions.append(act);
+    }
 }
 
 void MainWindow::onTabCloseRequested(int tabIndex)
 {
-    CodeEditor *tabEditor = qobject_cast<CodeEditor *>(editorTabs->widget(tabIndex));
-    if (!tabEditor)
-        return;
-
-    if (session) {
-        const QString relPath = toSessionKey(tabEditor->getFilePath());
-        if (session->hasActiveRGA(relPath)) {
-            tabEditor->clearRemoteCursors();
-            session->releaseRGA(relPath);
-        }
-        markTabAsCollab(tabEditor, false);
-    }
-
-    if (tabEditor->isModified() && !(session && session->role() == CollabSession::Role::Guest)) {
-        const auto btn = QMessageBox::question(this,
-                                               "Unsaved Changes",
-                                               "Save changes before closing this tab?",
-                                               QMessageBox::Save | QMessageBox::Discard
-                                                   | QMessageBox::Cancel);
-        if (btn == QMessageBox::Save) {
-            editor = tabEditor;
-            if (!saveFile())
-                return;
-        } else if (btn == QMessageBox::Cancel) {
-            return;
-        }
-    }
-
-    editorTabs->removeTab(tabIndex);
-    tabEditor->deleteLater();
+    QTabWidget *tabs = qobject_cast<QTabWidget *>(sender());
+    if (!tabs)
+        tabs = editorTabs;
+    closeTabAt(tabs, tabIndex);
 }
 
 void MainWindow::setSidePanelPage(int index)
@@ -1006,7 +1273,7 @@ void MainWindow::setupCentralWidget()
     centralSplitter->setObjectName("centralSplitter");
     centralSplitter->setChildrenCollapsible(false);
     centralSplitter->addWidget(leftPanel);
-    centralSplitter->addWidget(editorTabs);
+    centralSplitter->addWidget(editorStack);
     centralSplitter->setStretchFactor(0, 0);
     centralSplitter->setStretchFactor(1, 1);
     centralSplitter->setSizes({260, 1140});
@@ -1150,12 +1417,12 @@ void MainWindow::setupLeftPanel()
     noVl->setSpacing(4);
 
     btnStartCollab = new QPushButton("Start Collab");
-    btnStartCollab->setObjectName("voipBtn");
+    btnStartCollab->setObjectName("primaryBtn");
     connect(btnStartCollab, &QPushButton::clicked, this, [this]() { showStartCollabDialog(); });
     noVl->addWidget(btnStartCollab);
 
     btnJoinCollab = new QPushButton("Join Collab");
-    btnJoinCollab->setObjectName("voipBtn");
+    btnJoinCollab->setObjectName("primaryBtn");
     connect(btnJoinCollab, &QPushButton::clicked, this, &MainWindow::joinCollab);
     noVl->addWidget(btnJoinCollab);
 
@@ -1180,8 +1447,13 @@ void MainWindow::setupLeftPanel()
             &MainWindow::onCollabUserContextMenu);
     inVl->addWidget(collabUsersList, 1);
 
+    sessionTimerLabel = new QLabel("00:00:00");
+    sessionTimerLabel->setObjectName("stubLabel");
+    sessionTimerLabel->setAlignment(Qt::AlignCenter);
+    inVl->addWidget(sessionTimerLabel);
+
     btnSessionReport = new QPushButton("Session Report");
-    btnSessionReport->setObjectName("voipBtn");
+    btnSessionReport->setObjectName("primaryBtn");
     connect(btnSessionReport, &QPushButton::clicked, this, [this]() {
         if (!session)
             return;
@@ -1191,7 +1463,7 @@ void MainWindow::setupLeftPanel()
     inVl->addWidget(btnSessionReport);
 
     btnStopAllCollab = new QPushButton("End Collab");
-    btnStopAllCollab->setObjectName("voipBtn");
+    btnStopAllCollab->setObjectName("dangerBtn");
     connect(btnStopAllCollab, &QPushButton::clicked, this, &MainWindow::onEndCollabRequested);
     inVl->addWidget(btnStopAllCollab);
 
@@ -1208,15 +1480,17 @@ void MainWindow::setupLeftPanel()
 
 void MainWindow::openFileFromBrowser(const QString &path)
 {
-    for (int i = 0; i < editorTabs->count(); i++) {
-        CodeEditor *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
+    QTabWidget *target = focusedTabs ? focusedTabs : editorTabs;
+
+    for (int i = 0; i < target->count(); i++) {
+        CodeEditor *ed = qobject_cast<CodeEditor *>(target->widget(i));
         if (ed && ed->getFilePath() == path) {
-            editorTabs->setCurrentIndex(i);
+            target->setCurrentIndex(i);
             return;
         }
     }
 
-    CodeEditor *newEditor = new CodeEditor(editorTabs);
+    CodeEditor *newEditor = new CodeEditor(target);
 
     const bool isGuest = session && session->role() == CollabSession::Role::Guest;
 
@@ -1242,10 +1516,34 @@ void MainWindow::openFileFromBrowser(const QString &path)
             this,
             &MainWindow::onCursorPositionUpdated);
     connect(newEditor, &CodeEditor::modifyChanged, this, &MainWindow::onModificationChanged);
+    connect(newEditor, &CodeEditor::fileModified, this, [this, newEditor] {
+        if (editor == newEditor)
+            updateUndoRedoState();
+    });
+
+    auto syncSiblings = [this, newEditor]() {
+        const QString filePath = newEditor->getFilePath();
+        if (filePath.isEmpty())
+            return;
+        const QString text = newEditor->text();
+        for (QTabWidget *tabs : allTabWidgets()) {
+            for (int i = 0; i < tabs->count(); i++) {
+                auto *sibling = qobject_cast<CodeEditor *>(tabs->widget(i));
+                if (sibling && sibling != newEditor && sibling->getFilePath() == filePath)
+                    sibling->applyRemoteText(text);
+            }
+        }
+    };
+    connect(newEditor, &CodeEditor::localInsert, this, [syncSiblings](int, QChar) {
+        syncSiblings();
+    });
+    connect(newEditor, &CodeEditor::localDelete, this, [syncSiblings](int) { syncSiblings(); });
 
     const QString name = QFileInfo(path).fileName();
-    const int tabIdx = editorTabs->addTab(newEditor, name);
-    editorTabs->setCurrentIndex(tabIdx);
+    const int tabIdx = target->addTab(newEditor, name);
+
+    target->setCurrentIndex(tabIdx);
+    updateWelcomeVisibility();
     updateRunCombo();
 
     if (session) {
@@ -1273,14 +1571,128 @@ void MainWindow::openFileFromBrowser(const QString &path)
 
 void MainWindow::setupEditorArea()
 {
+    editorSplitter = new QSplitter(Qt::Horizontal);
+    editorSplitter->setObjectName("editorSplitter");
+    editorSplitter->setChildrenCollapsible(false);
+
     editorTabs = new QTabWidget;
     editorTabs->setObjectName("editorTabs");
     editorTabs->setTabsClosable(true);
     editorTabs->setMovable(true);
     editorTabs->setDocumentMode(true);
     editor = nullptr;
-
     connect(editorTabs, &QTabWidget::tabCloseRequested, this, &MainWindow::onTabCloseRequested);
+    connect(editorTabs, &QTabWidget::currentChanged, this, &MainWindow::onTabChanged);
+    editorTabs->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(editorTabs->tabBar(),
+            &QTabBar::customContextMenuRequested,
+            this,
+            [this](const QPoint &pos) { showTabContextMenu(editorTabs, pos); });
+
+    editorTabs2 = new QTabWidget;
+    editorTabs2->setObjectName("editorTabs");
+    editorTabs2->setTabsClosable(true);
+    editorTabs2->setMovable(true);
+    editorTabs2->setDocumentMode(true);
+    editorTabs2->hide();
+    connect(editorTabs2, &QTabWidget::tabCloseRequested, this, &MainWindow::onTabCloseRequested);
+    connect(editorTabs2, &QTabWidget::currentChanged, this, &MainWindow::onTabChanged);
+    editorTabs2->tabBar()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(editorTabs2->tabBar(),
+            &QTabBar::customContextMenuRequested,
+            this,
+            [this](const QPoint &pos) { showTabContextMenu(editorTabs2, pos); });
+
+    editorSplitter->addWidget(editorTabs);
+    editorSplitter->addWidget(editorTabs2);
+    editorSplitter->setStretchFactor(0, 1);
+    editorSplitter->setStretchFactor(1, 1);
+
+    focusedTabs = editorTabs;
+
+    welcomeWidget = new QWidget;
+    welcomeWidget->setObjectName("welcomeWidget");
+    auto *wl = new QVBoxLayout(welcomeWidget);
+    wl->setContentsMargins(0, 0, 0, 0);
+    wl->setSpacing(0);
+    wl->setAlignment(Qt::AlignCenter);
+
+    auto *centerBox = new QWidget;
+    centerBox->setFixedWidth(420);
+    auto *cl = new QVBoxLayout(centerBox);
+    cl->setContentsMargins(0, 0, 0, 0);
+    cl->setSpacing(0);
+
+    auto *titleLabel = new QLabel("TeamHub");
+    titleLabel->setObjectName("welcomeTitle");
+    titleLabel->setAlignment(Qt::AlignCenter);
+    cl->addWidget(titleLabel);
+
+    auto *subtitleLabel = new QLabel("Collaborative Code Editor");
+    subtitleLabel->setObjectName("welcomeSubtitle");
+    subtitleLabel->setAlignment(Qt::AlignCenter);
+    cl->addWidget(subtitleLabel);
+
+    cl->addSpacing(40);
+
+    auto *recentHeader = new QLabel("RECENT PROJECTS");
+    recentHeader->setObjectName("welcomeSectionHeader");
+    recentHeader->setAlignment(Qt::AlignLeft);
+    cl->addWidget(recentHeader);
+    cl->addSpacing(10);
+
+    auto *recentContainer = new QWidget;
+    recentProjectsLayout = new QVBoxLayout(recentContainer);
+    recentProjectsLayout->setContentsMargins(0, 0, 0, 0);
+    recentProjectsLayout->setSpacing(1);
+    cl->addWidget(recentContainer);
+
+    cl->addSpacing(32);
+
+    auto *btnOpenFile = new QPushButton("Open File...");
+    btnOpenFile->setObjectName("welcomeOpenFile");
+    btnOpenFile->setCursor(Qt::PointingHandCursor);
+    btnOpenFile->setFixedWidth(160);
+    connect(btnOpenFile, &QPushButton::clicked, this, &MainWindow::openFile);
+    cl->addWidget(btnOpenFile, 0, Qt::AlignCenter);
+
+    cl->addSpacing(40);
+
+    const QString shortcutRow = "<table cellspacing='0' cellpadding='0' align='center'>"
+                                "<tr>"
+                                "<td align='right'><code style='color:#569cd6'>Ctrl+O</code></td>"
+                                "<td width='8'></td>"
+                                "<td><span style='color:#858585'>Open File</span></td>"
+                                "<td width='28'></td>"
+                                "<td align='right'><code style='color:#569cd6'>Ctrl+B</code></td>"
+                                "<td width='8'></td>"
+                                "<td><span style='color:#858585'>Toggle Panel</span></td>"
+                                "</tr>"
+                                "<tr><td height='5'></td></tr>"
+                                "<tr>"
+                                "<td align='right'><code style='color:#569cd6'>Ctrl+\\</code></td>"
+                                "<td width='8'></td>"
+                                "<td><span style='color:#858585'>Split Editor</span></td>"
+                                "<td width='28'></td>"
+                                "<td align='right'><code style='color:#569cd6'>Ctrl+J</code></td>"
+                                "<td width='8'></td>"
+                                "<td><span style='color:#858585'>Toggle Output</span></td>"
+                                "</tr>"
+                                "</table>";
+    auto *shortcutsLabel = new QLabel(shortcutRow);
+    shortcutsLabel->setObjectName("welcomeShortcuts");
+    shortcutsLabel->setTextFormat(Qt::RichText);
+    shortcutsLabel->setAlignment(Qt::AlignCenter);
+    cl->addWidget(shortcutsLabel, 0, Qt::AlignCenter);
+
+    wl->addWidget(centerBox, 0, Qt::AlignCenter);
+
+    editorStack = new QStackedWidget;
+    editorStack->addWidget(welcomeWidget);
+    editorStack->addWidget(editorSplitter);
+    editorStack->setCurrentIndex(0);
+
+    refreshWelcomeRecent();
 }
 
 void MainWindow::setupBottomDock()
@@ -1457,7 +1869,8 @@ void MainWindow::startDebugging()
         return;
     }
 
-    CodeEditor *ed = qobject_cast<CodeEditor *>(editorTabs->currentWidget());
+    CodeEditor *ed = qobject_cast<CodeEditor *>(
+        (focusedTabs ? focusedTabs : editorTabs)->currentWidget());
     if (!ed)
         return;
 
@@ -1521,14 +1934,21 @@ void MainWindow::onDebugStopped(const QString &filePath, int line, const QString
     };
     const QString stoppedNorm = normPath(filePath);
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
-        if (!ed)
-            continue;
-        if (normPath(ed->getFilePath()) == stoppedNorm) {
-            editorTabs->setCurrentIndex(i);
-            ed->setDebugLine(line);
+    bool debugFound = false;
+    for (QTabWidget *tabs : allTabWidgets()) {
+        if (debugFound)
             break;
+        for (int i = 0; i < tabs->count(); ++i) {
+            auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i));
+            if (!ed)
+                continue;
+            if (normPath(ed->getFilePath()) == stoppedNorm) {
+                tabs->setCurrentIndex(i);
+                focusedTabs = tabs;
+                ed->setDebugLine(line);
+                debugFound = true;
+                break;
+            }
         }
     }
 
@@ -1648,10 +2068,12 @@ void MainWindow::onDebugVariableExpanded(QTreeWidgetItem *item)
 
 void MainWindow::clearDebugHighlights()
 {
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i));
-        if (ed)
-            ed->clearDebugLine();
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i));
+            if (ed)
+                ed->clearDebugLine();
+        }
     }
 }
 
@@ -1686,6 +2108,7 @@ void MainWindow::openDiffTab(const QString &relPath, bool staged)
     applyDiff(ed);
 
     const int idx = editorTabs->addTab(ed, tabName);
+
     editorTabs->setCurrentIndex(idx);
 }
 
@@ -1707,9 +2130,134 @@ void MainWindow::setupStatusBar()
     statusBar()->addPermanentWidget(statusLanguage);
 }
 
+void MainWindow::updateWelcomeVisibility()
+{
+    const bool empty = (editorTabs->count() == 0 && !splitActive);
+    if (empty)
+        refreshWelcomeRecent();
+    editorStack->setCurrentIndex(empty ? 0 : 1);
+}
+
+void MainWindow::refreshWelcomeRecent()
+{
+    while (recentProjectsLayout->count())
+        delete recentProjectsLayout->takeAt(0)->widget();
+
+    const auto projects = ProjectDB::instance().recentProjects(8);
+    if (projects.isEmpty()) {
+        auto *lbl = new QLabel("No recent projects.");
+        lbl->setObjectName("stubLabel");
+        recentProjectsLayout->addWidget(lbl);
+        return;
+    }
+    const QIcon folderIc = QApplication::style()->standardIcon(QStyle::SP_DirIcon);
+
+    for (const auto &p : projects) {
+        auto *row = new QFrame;
+        row->setObjectName("welcomeRecentRow");
+        row->setCursor(Qt::PointingHandCursor);
+        row->setProperty("recentPath", p.path);
+
+        auto *rl = new QHBoxLayout(row);
+        rl->setContentsMargins(12, 8, 12, 8);
+        rl->setSpacing(12);
+
+        auto *iconLbl = new QLabel;
+        iconLbl->setPixmap(folderIc.pixmap(18, 18));
+        iconLbl->setFixedSize(18, 18);
+        rl->addWidget(iconLbl);
+
+        auto *textCol = new QVBoxLayout;
+        textCol->setContentsMargins(0, 0, 0, 0);
+        textCol->setSpacing(2);
+
+        auto *nameLbl = new QLabel(p.name);
+        nameLbl->setObjectName("welcomeRecentName");
+
+        auto *pathLbl = new QLabel(p.path);
+        pathLbl->setObjectName("welcomeRecentPath");
+        pathLbl->setMaximumWidth(370);
+
+        textCol->addWidget(nameLbl);
+        textCol->addWidget(pathLbl);
+        rl->addLayout(textCol, 1);
+
+        row->installEventFilter(this);
+        recentProjectsLayout->addWidget(row);
+    }
+}
+
+void MainWindow::showToast(const QString &msg, const QString &type)
+{
+    static const int kW = 300, kH = 38, kMargin = 16, kGap = 6;
+
+    auto *toast = new QFrame(this);
+    toast->setFixedSize(kW, kH);
+    toast->setAttribute(Qt::WA_DeleteOnClose);
+    toast->setStyleSheet("QFrame { background:#2d2d30; border:none; border-radius:4px; }"
+                         "QLabel { color:#cccccc; font-size:12px; background:transparent; }");
+
+    const QString accentColor = (type == "success")   ? "#4ec9b0"
+                                : (type == "warning") ? "#e2c08d"
+                                : (type == "error")   ? "#f14c4c"
+                                                      : "#007acc";
+
+    auto *hl = new QHBoxLayout(toast);
+    hl->setContentsMargins(0, 0, 12, 0);
+    hl->setSpacing(10);
+
+    auto *bar = new QWidget(toast);
+    bar->setFixedWidth(3);
+    bar->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+    bar->setStyleSheet(QString("background:%1; border-radius:2px;").arg(accentColor));
+    hl->addWidget(bar);
+
+    auto *lbl = new QLabel(msg, toast);
+    lbl->setWordWrap(false);
+    hl->addWidget(lbl, 1);
+
+    int yOffset = 0;
+    for (auto *t : activeToasts)
+        yOffset += t->height() + kGap;
+    toast->move(width() - kW - kMargin, height() - kH - 36 - yOffset);
+    toast->raise();
+    toast->show();
+    activeToasts.append(toast);
+
+    QTimer::singleShot(3500, this, [this, toast]() {
+        activeToasts.removeOne(toast);
+        toast->close();
+    });
+}
+
+void MainWindow::updateUndoRedoState()
+{
+    bool canUndo = false, canRedo = false;
+    if (editor) {
+        if (editor->collabActive) {
+            RGAManager *mgr = editorToMgr.value(editor, nullptr);
+            if (mgr) {
+                canUndo = mgr->canUndo();
+                canRedo = mgr->canRedo();
+            }
+        } else {
+            canUndo = editor->isUndoAvailable();
+            canRedo = editor->isRedoAvailable();
+        }
+    }
+    if (actUndo)
+        actUndo->setEnabled(canUndo);
+    if (actRedo)
+        actRedo->setEnabled(canRedo);
+}
+
 void MainWindow::onTabChanged(int index)
 {
-    CodeEditor *activeEditor = qobject_cast<CodeEditor *>(editorTabs->widget(index));
+    QTabWidget *sourceTabs = qobject_cast<QTabWidget *>(sender());
+    if (!sourceTabs)
+        sourceTabs = editorTabs;
+    focusedTabs = sourceTabs;
+    CodeEditor *activeEditor = qobject_cast<CodeEditor *>(sourceTabs->widget(index));
     if (!activeEditor) {
         editor = nullptr;
         currentFilePath.clear();
@@ -1731,6 +2279,31 @@ void MainWindow::onTabChanged(int index)
     statusPosition->setText(QString("Ln %1, Col %2")
                                 .arg(activeEditor->currentLine() + 1)
                                 .arg(activeEditor->currentColumn() + 1));
+
+    static const QMap<QString, QString> extToLang = {
+        {"py", "Python"},
+        {"cpp", "C++"},
+        {"cxx", "C++"},
+        {"cc", "C++"},
+        {"c", "C"},
+        {"h", "C/C++ Header"},
+        {"hpp", "C++ Header"},
+        {"js", "JavaScript"},
+        {"ts", "TypeScript"},
+        {"json", "JSON"},
+        {"md", "Markdown"},
+        {"txt", "Plain Text"},
+        {"pro", "Qt Project"},
+        {"qml", "QML"},
+        {"xml", "XML"},
+        {"html", "HTML"},
+        {"css", "CSS"},
+    };
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    statusLanguage->setText(
+        extToLang.value(suffix, suffix.isEmpty() ? "Plain Text" : suffix.toUpper()));
+
+    updateUndoRedoState();
     updateWindowTitle();
 
     if (session && session->isConnected()) {
@@ -1743,8 +2316,10 @@ void MainWindow::onTabChanged(int index)
             session->sendFileFocus(relPath);
             peerFiles[session->siteId()] = relPath;
             refreshCollabUsersList();
+            refreshPresenceBar();
         } else {
             currentCollabFile.clear();
+            refreshPresenceBar();
         }
     }
 }
@@ -1758,10 +2333,10 @@ void MainWindow::applyTheme()
 
 void MainWindow::updateWindowTitle()
 {
-    const QString name = currentFilePath.isEmpty() ? "Untitled"
+    const QString name = currentFilePath.isEmpty() ? (editor ? "Untitled" : "TeamHub")
                                                    : QFileInfo(currentFilePath).fileName();
     const QString dirty = (editor && editor->isModified()) ? " \u25cf" : "";
-    setWindowTitle(name + dirty + " \u2014 TeamHub");
+    setWindowTitle(name + dirty);
 }
 
 void MainWindow::onActivityButton(int page)
@@ -1780,11 +2355,12 @@ void MainWindow::onModificationChanged(bool modified)
                                                    : QFileInfo(currentFilePath).fileName();
     const QString dirty = modified ? " \u25cf" : "";
 
-    setWindowTitle(name + dirty + " \u2014 TeamHub");
+    setWindowTitle(name + dirty);
 
-    const int idx = editorTabs->currentIndex();
+    QTabWidget *activeTabs = focusedTabs ? focusedTabs : editorTabs;
+    const int idx = activeTabs->currentIndex();
     if (idx >= 0)
-        editorTabs->setTabText(idx, name + dirty);
+        activeTabs->setTabText(idx, name + dirty);
 }
 
 void MainWindow::updateRunCombo()
@@ -1795,11 +2371,13 @@ void MainWindow::updateRunCombo()
     runFileCombo->blockSignals(true);
     runFileCombo->clear();
     runFileCombo->addItem("Current File", QString());
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i))) {
-            const QString fp = ed->getFilePath();
-            if (!fp.isEmpty())
-                runFileCombo->addItem(QFileInfo(fp).fileName(), fp);
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            if (auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i))) {
+                const QString fp = ed->getFilePath();
+                if (!fp.isEmpty())
+                    runFileCombo->addItem(QFileInfo(fp).fileName(), fp);
+            }
         }
     }
     const int idx = runFileCombo->findText(current);
@@ -1834,7 +2412,8 @@ void MainWindow::runFile()
     if (runFileCombo && runFileCombo->currentIndex() >= 0)
         path = runFileCombo->currentData().toString();
     if (path.isEmpty()) {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->currentWidget()))
+        if (auto *ed = qobject_cast<CodeEditor *>(
+                (focusedTabs ? focusedTabs : editorTabs)->currentWidget()))
             path = ed->getFilePath();
     }
     if (path.isEmpty()) {
@@ -1845,11 +2424,13 @@ void MainWindow::runFile()
     if (QFileInfo(path).isRelative() && !fileBrowser->rootPath().isEmpty())
         path = QDir(fileBrowser->rootPath()).absoluteFilePath(path);
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i))) {
-            const QString fp = ed->getFilePath();
-            if (!fp.isEmpty() && ed->isModified())
-                ed->saveFile(fp);
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            if (auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i))) {
+                const QString fp = ed->getFilePath();
+                if (!fp.isEmpty() && ed->isModified())
+                    ed->saveFile(fp);
+            }
         }
     }
 
@@ -1957,34 +2538,26 @@ void MainWindow::clearTabs()
         editorTabs->removeTab(0);
         delete w;
     }
+    while (editorTabs2 && editorTabs2->count() > 0) {
+        QWidget *w = editorTabs2->widget(0);
+        editorTabs2->removeTab(0);
+        w->deleteLater();
+    }
     editor = nullptr;
 }
 
 void MainWindow::openFile()
 {
-    const QString path = QFileDialog::getOpenFileName(this,
-                                                      "Open File",
-                                                      {},
-                                                      "Python Files (*.py);;All Files (*)");
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        "Open File",
+        {},
+        "All Files (*);;Python Files (*.py);;C/C++ Files (*.cpp *.c *.h *.hpp);;"
+        "Web Files (*.js *.ts *.html *.css);;JSON (*.json);;Markdown (*.md)");
     if (path.isEmpty())
         return;
 
-    CodeEditor *newEditor = new CodeEditor(editorTabs);
-    newEditor->loadFile(path);
-    connect(newEditor,
-            &CodeEditor::cursorPositionUpdated,
-            this,
-            &MainWindow::onCursorPositionUpdated);
-    connect(newEditor, &CodeEditor::modifyChanged, this, &MainWindow::onModificationChanged);
-
-    const QString name = QFileInfo(path).fileName();
-    int index = editorTabs->addTab(newEditor, name);
-    editorTabs->setCurrentIndex(index);
-
-    currentFilePath = path;
-    statusFile->setText(name);
-    updateWindowTitle();
-    outputPane->appendPlainText("[TeamHub] Opened: " + path);
+    openFileFromBrowser(path);
 }
 
 void MainWindow::openFolder()
@@ -2001,7 +2574,7 @@ void MainWindow::openProjectFolder(const QString &path)
     clearTabs();
 
     const QString name = QFileInfo(path).fileName();
-    setWindowTitle(name + " — TeamHub");
+    setWindowTitle(name);
     outputPane->appendPlainText("[TeamHub] Opened folder: " + path);
     terminal->setWorkingDirectory(path);
     if (gitPanel_)
@@ -2101,7 +2674,8 @@ void MainWindow::cloneRepo()
 
 bool MainWindow::saveFile()
 {
-    CodeEditor *activeEditor = qobject_cast<CodeEditor *>(editorTabs->currentWidget());
+    QTabWidget *activeTabs = focusedTabs ? focusedTabs : editorTabs;
+    CodeEditor *activeEditor = qobject_cast<CodeEditor *>(activeTabs->currentWidget());
     if (!activeEditor)
         return false;
 
@@ -2115,9 +2689,10 @@ bool MainWindow::saveFile()
     const QString name = QFileInfo(path).fileName();
     currentFilePath = path;
     statusFile->setText(name);
-    editorTabs->setTabText(editorTabs->currentIndex(), name);
+    activeTabs->setTabText(activeTabs->currentIndex(), name);
     updateWindowTitle();
     outputPane->appendPlainText("[TeamHub] Saved: " + path);
+    fileBrowser->refreshGitStatus();
     return true;
 }
 
@@ -2152,8 +2727,17 @@ void MainWindow::toggleBottomDock()
     bottomDock->setVisible(!bottomDock->isVisible());
 }
 
-void MainWindow::onSessionProjectInit(int /*hostSiteId*/, const QStringList &files)
+void MainWindow::onSessionProjectInit(int hostSiteId, const QStringList &files)
 {
+    if (hostSiteId > 0 && !peerRoles.contains(hostSiteId))
+        peerRoles[hostSiteId] = "host";
+
+    if (session) {
+        const qint64 epoch = session->sessionStartEpoch();
+        if (epoch > 0)
+            sessionStart = QDateTime::fromSecsSinceEpoch(epoch);
+    }
+
     const bool readOnly = session && session->collabMode() == CollabSession::Mode::ReadOnly;
     outputPane->appendPlainText(QString("[Collab] Project received — %1 file(s)%2")
                                     .arg(files.size())
@@ -2179,6 +2763,7 @@ void MainWindow::onSessionRunOutput(const QString &text)
 void MainWindow::onSessionFileCreated(const QString &relPath)
 {
     outputPane->appendPlainText("[Collab] File created: " + relPath);
+    showToast("Created: " + relPath, "success");
 
     if (session && session->role() == CollabSession::Role::Guest)
         fileBrowser->setRemoteFiles(session->fileList());
@@ -2187,6 +2772,8 @@ void MainWindow::onSessionFileCreated(const QString &relPath)
 void MainWindow::onSessionFileDeleted(const QString &relPath)
 {
     outputPane->appendPlainText("[Collab] File deleted: " + relPath);
+    showToast("Deleted: " + relPath, "warning");
+
     if (session && session->role() == CollabSession::Role::Guest)
         fileBrowser->setRemoteFiles(session->fileList());
 }
@@ -2201,6 +2788,14 @@ void MainWindow::onSessionFileRenamed(const QString &oldPath, const QString &new
 bool MainWindow::showStartCollabDialog()
 {
     const QString projectRoot = fileBrowser->rootPath();
+
+    if (projectRoot.isEmpty()) {
+        QMessageBox::warning(
+            this,
+            "No Project Open",
+            "You need to open a project folder before starting a collaboration session.");
+        return false;
+    }
 
     QDialog dlg(this);
     dlg.setWindowTitle("Start Collaboration");
@@ -2296,6 +2891,7 @@ bool MainWindow::showStartCollabDialog()
     auto *btnCancel = new QPushButton("Cancel");
     auto *btnStart = new QPushButton("Start");
     btnStart->setDefault(true);
+    btnStart->setObjectName("primaryBtn");
     btnRow->addWidget(btnCancel);
     btnRow->addWidget(btnStart);
     mainVl->addLayout(btnRow);
@@ -2348,7 +2944,7 @@ void MainWindow::onCollabUserContextMenu(const QPoint &pos)
 
     const QString relPath = peerFiles.value(targetSiteId);
     const QString peerName = peerNames.value(targetSiteId, QString("user_%1").arg(targetSiteId));
-    QAction *gotoAct = menu.addAction(QString("Перейти до %1").arg(peerName));
+    QAction *gotoAct = menu.addAction(QString("Go to %1").arg(peerName));
     gotoAct->setEnabled(!relPath.isEmpty());
     connect(gotoAct, &QAction::triggered, this, [this, targetSiteId, relPath]() {
         if (!session || relPath.isEmpty())
@@ -2365,7 +2961,8 @@ void MainWindow::onCollabUserContextMenu(const QPoint &pos)
 
         openFileFromBrowser(openPath);
 
-        CodeEditor *targetEd = qobject_cast<CodeEditor *>(editorTabs->currentWidget());
+        QTabWidget *activeTabs = focusedTabs ? focusedTabs : editorTabs;
+        CodeEditor *targetEd = qobject_cast<CodeEditor *>(activeTabs->currentWidget());
         if (targetEd) {
             const int scintillaPos = targetEd->remoteCursorPos(targetSiteId);
             if (scintillaPos >= 0)
@@ -2375,6 +2972,26 @@ void MainWindow::onCollabUserContextMenu(const QPoint &pos)
 
     if (session->role() == CollabSession::Role::Host) {
         menu.addSeparator();
+
+        QMenu *roleMenu = menu.addMenu("Change role");
+        const QString currentRole = peerRoles.value(targetSiteId, "write");
+        for (const auto &pair :
+             std::initializer_list<std::pair<const char *, const char *>>{{"write", "Write"},
+                                                                          {"read", "Read"}}) {
+            const QString key = pair.first;
+            const QString lbl = pair.second;
+            QAction *act = roleMenu->addAction(lbl);
+            act->setCheckable(true);
+            act->setChecked(currentRole == key);
+            connect(act, &QAction::triggered, this, [this, targetSiteId, key]() {
+                if (!session)
+                    return;
+                peerRoles[targetSiteId] = key;
+                session->sendRoleChange(targetSiteId, key);
+                refreshCollabUsersList();
+            });
+        }
+
         QAction *kickAct = menu.addAction(QString("Kick %1").arg(peerName));
         connect(kickAct, &QAction::triggered, this, [this, targetSiteId, peerName]() {
             if (!session)
@@ -2608,11 +3225,13 @@ void MainWindow::applySettings()
     const int tabW = s.tabWidth();
     const auto theme = (s.theme() == "dark") ? CodeEditor::Theme::Dark : CodeEditor::Theme::Light;
 
-    for (int i = 0; i < editorTabs->count(); ++i) {
-        if (auto *ed = qobject_cast<CodeEditor *>(editorTabs->widget(i))) {
-            ed->applyEditorFont(font);
-            ed->setTabWidth(tabW);
-            ed->setTheme(theme);
+    for (QTabWidget *tabs : allTabWidgets()) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            if (auto *ed = qobject_cast<CodeEditor *>(tabs->widget(i))) {
+                ed->applyEditorFont(font);
+                ed->setTabWidth(tabW);
+                ed->setTheme(theme);
+            }
         }
     }
 }
@@ -2661,4 +3280,148 @@ void MainWindow::saveSessionToDb()
         files.append({fp, i, i == current});
     }
     ProjectDB::instance().saveOpenFiles(currentProjectId, files);
+}
+
+QList<QTabWidget *> MainWindow::allTabWidgets() const
+{
+    QList<QTabWidget *> list;
+    list.append(editorTabs);
+    if (splitActive && editorTabs2)
+        list.append(editorTabs2);
+    return list;
+}
+
+void MainWindow::openInSplitPanel(const QString &path, QTabWidget *sourcePanel)
+{
+    QTabWidget *other = (sourcePanel == editorTabs) ? editorTabs2 : editorTabs;
+
+    for (int i = 0; i < other->count(); i++) {
+        if (auto *ed = qobject_cast<CodeEditor *>(other->widget(i))) {
+            if (ed->getFilePath() == path) {
+                other->setCurrentIndex(i);
+                focusedTabs = other;
+                return;
+            }
+        }
+    }
+
+    if (!splitActive) {
+        splitActive = true;
+        editorTabs2->show();
+        editorSplitter->setSizes({editorSplitter->width() / 2, editorSplitter->width() / 2});
+    }
+
+    focusedTabs = other;
+    openFileFromBrowser(path);
+}
+
+void MainWindow::closeTabAt(QTabWidget *tabs, int index)
+{
+    CodeEditor *tabEditor = qobject_cast<CodeEditor *>(tabs->widget(index));
+    if (!tabEditor)
+        return;
+
+    editorToMgr.remove(tabEditor);
+
+    if (session) {
+        const QString relPath = toSessionKey(tabEditor->getFilePath());
+        if (session->hasActiveRGA(relPath)) {
+            tabEditor->clearRemoteCursors();
+
+            bool fileOpenElsewhere = false;
+            for (QTabWidget *tw : allTabWidgets()) {
+                for (int i = 0; i < tw->count(); ++i) {
+                    auto *other = qobject_cast<CodeEditor *>(tw->widget(i));
+                    if (other && other != tabEditor
+                        && toSessionKey(other->getFilePath()) == relPath) {
+                        fileOpenElsewhere = true;
+                        break;
+                    }
+                }
+                if (fileOpenElsewhere)
+                    break;
+            }
+
+            if (!fileOpenElsewhere)
+                session->releaseRGA(relPath);
+        }
+        markTabAsCollab(tabEditor, false);
+    }
+
+    if (tabEditor->isModified() && !(session && session->role() == CollabSession::Role::Guest)) {
+        const auto btn = QMessageBox::question(this,
+                                               "Unsaved Changes",
+                                               "Save changes before closing this tab?",
+                                               QMessageBox::Save | QMessageBox::Discard
+                                                   | QMessageBox::Cancel);
+        if (btn == QMessageBox::Save) {
+            editor = tabEditor;
+            if (!saveFile())
+                return;
+        } else if (btn == QMessageBox::Cancel) {
+            return;
+        }
+    }
+
+    tabs->blockSignals(true);
+    tabs->removeTab(index);
+    tabs->blockSignals(false);
+    tabEditor->deleteLater();
+
+    updateWelcomeVisibility();
+
+    if (tabs == editorTabs2 && editorTabs2->count() == 0) {
+        splitActive = false;
+        editorTabs2->hide();
+        focusedTabs = editorTabs;
+        if (editorTabs->count() > 0)
+            onTabChanged(editorTabs->currentIndex());
+        return;
+    }
+
+    if (tabs == editorTabs && editorTabs->count() == 0 && splitActive) {
+        editorTabs2->blockSignals(true);
+        while (editorTabs2->count() > 0) {
+            QWidget *w = editorTabs2->widget(0);
+            const QString label = editorTabs2->tabText(0);
+            editorTabs2->removeTab(0);
+            editorTabs->addTab(w, label);
+        }
+        editorTabs2->blockSignals(false);
+        splitActive = false;
+        editorTabs2->hide();
+        focusedTabs = editorTabs;
+        if (editorTabs->count() > 0)
+            editorTabs->setCurrentIndex(editorTabs->count() - 1);
+    }
+}
+
+void MainWindow::showTabContextMenu(QTabWidget *tabs, const QPoint &pos)
+{
+    const int tabIndex = tabs->tabBar()->tabAt(pos);
+    if (tabIndex < 0)
+        return;
+
+    QMenu menu(this);
+    menu.addAction("Close Tab", [this, tabs, tabIndex]() { closeTabAt(tabs, tabIndex); });
+
+    if (tabs->count() > 1) {
+        menu.addAction("Close Others", [this, tabs, tabIndex]() {
+            for (int i = tabs->count() - 1; i > tabIndex; --i)
+                closeTabAt(tabs, i);
+            for (int i = tabIndex - 1; i >= 0; --i)
+                closeTabAt(tabs, i);
+        });
+    }
+
+    auto *ed = qobject_cast<CodeEditor *>(tabs->widget(tabIndex));
+    if (ed && !ed->getFilePath().isEmpty()) {
+        menu.addAction("Split Tab", [this, tabs, tabIndex]() {
+            auto *ed = qobject_cast<CodeEditor *>(tabs->widget(tabIndex));
+            if (ed)
+                openInSplitPanel(ed->getFilePath(), tabs);
+        });
+    }
+
+    menu.exec(tabs->tabBar()->mapToGlobal(pos));
 }

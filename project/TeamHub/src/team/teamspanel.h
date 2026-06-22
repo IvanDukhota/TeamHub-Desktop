@@ -44,7 +44,6 @@ private:
 
     QListWidget *teamsList;
     QLabel *teamsEmptyHint;
-    QPushButton *btnNewTeam;
 
     QLabel *detailsTitle;
     QLabel *detailsDesc;
@@ -52,7 +51,8 @@ private:
     QListWidget *membersList;
     QPushButton *btnNewRoom;
     QListWidget *roomsList;
-    QLabel *roomsEmptyHint;
+    QWidget *roomsEmptyWidget;
+    QPushButton *btnCreateRoomEmpty;
 
     QString selectedTeamId;
     bool selectedTeamIsAdmin = false;
@@ -83,7 +83,6 @@ private:
     void showCallPane(bool on);
     void returnToVoiceRoomTeam();
 
-    void onNewTeamClicked();
     void onNewRoomClicked();
     void onRoomsContextMenu(const QPoint &pos);
     void onPeersContextMenu(const QPoint &pos);
