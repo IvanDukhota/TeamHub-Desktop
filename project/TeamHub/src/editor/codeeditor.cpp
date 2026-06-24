@@ -4,6 +4,7 @@
 #include <Qsci/qscicommandset.h>
 
 #include <QClipboard>
+#include <QDebug>
 #include <QColor>
 #include <QDir>
 #include <QFile>
@@ -259,6 +260,11 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
     const int key = event->key();
 
     if (mod == Qt::ControlModifier) {
+        if (key == Qt::Key_Space) {
+            if (lspClient)
+                requestLspCompletion();
+            return;
+        }
         if (key == Qt::Key_Z) {
             undo();
             return;
@@ -529,42 +535,35 @@ bool CodeEditor::handleBackspaceInPair(QKeyEvent *event)
 
 void CodeEditor::setupAutoComplete()
 {
-    QsciAPIs *apis = new QsciAPIs(lexer);
-
-    const QStringList keywords = {
-        "False",        "None",       "True",         "and",        "as",          "assert",
-        "async",        "await",      "break",        "class",      "continue",    "def",
-        "del",          "elif",       "else",         "except",     "finally",     "for",
-        "from",         "global",     "if",           "import",     "in",          "is",
-        "lambda",       "nonlocal",   "not",          "or",         "pass",        "raise",
-        "return",       "try",        "while",        "with",       "yield",       "abs",
-        "all",          "any",        "bool",         "breakpoint", "callable",    "chr",
-        "dict",         "dir",        "divmod",       "enumerate",  "eval",        "exec",
-        "filter",       "float",      "format",       "frozenset",  "getattr",     "globals",
-        "hasattr",      "hash",       "help",         "hex",        "id",          "input",
-        "int",          "isinstance", "issubclass",   "iter",       "len",         "list",
-        "locals",       "map",        "max",          "min",        "next",        "object",
-        "oct",          "open",       "ord",          "pow",        "print",       "property",
-        "range",        "repr",       "reversed",     "round",      "set",         "setattr",
-        "slice",        "sorted",     "staticmethod", "str",        "sum",         "super",
-        "tuple",        "type",       "vars",         "zip",        "self",        "cls",
-        "__init__",     "__str__",    "__repr__",     "__len__",    "__getitem__", "__setitem__",
-        "__contains__", "__iter__",   "__next__",     "__enter__",  "__exit__",    "__call__",
-        "__del__",
-    };
-
-    for (const auto &kw : keywords)
-        apis->add(kw);
-
-    apis->prepare();
-    lexer->setAPIs(apis);
-
-    setAutoCompletionSource(QsciScintilla::AcsAPIs);
-    setAutoCompletionThreshold(2);
+    setAutoCompletionSource(QsciScintilla::AcsNone);
     setAutoCompletionCaseSensitivity(false);
     setAutoCompletionReplaceWord(true);
     setAutoCompletionUseSingle(QsciScintilla::AcusExplicit);
     setCallTipsStyle(QsciScintilla::CallTipsNone);
+
+    SendScintilla(SCI_AUTOCSETORDER, (unsigned long) SC_ORDER_CUSTOM);
+
+    lspChangeTimer = new QTimer(this);
+    lspChangeTimer->setSingleShot(true);
+    lspChangeTimer->setInterval(80);
+    connect(lspChangeTimer, &QTimer::timeout, this, &CodeEditor::notifyLspChange);
+
+    lspCompleteTimer = new QTimer(this);
+    lspCompleteTimer->setSingleShot(true);
+    lspCompleteTimer->setInterval(300);
+    connect(lspCompleteTimer, &QTimer::timeout, this, &CodeEditor::requestLspCompletion);
+
+    connect(this, SIGNAL(textChanged()), lspChangeTimer, SLOT(start()));
+    connect(this, SIGNAL(textChanged()), lspCompleteTimer, SLOT(start()));
+    connect(this,
+            SIGNAL(SCN_AUTOCCOMPLETED(const char *, int, int, int)),
+            this,
+            SLOT(onAutoCompleted(const char *, int, int, int)));
+
+    hoverTimer = new QTimer(this);
+    hoverTimer->setSingleShot(true);
+    hoverTimer->setInterval(500);
+    connect(hoverTimer, &QTimer::timeout, this, &CodeEditor::onHoverTimeout);
 }
 
 void CodeEditor::setupLinter()
@@ -704,12 +703,19 @@ void CodeEditor::mouseMoveEvent(QMouseEvent *event)
         }
 
         if (closest) {
+            hoverTimer->stop();
             QToolTip::showText(event->globalPosition().toPoint(), closest->message, this);
             return;
         }
     }
 
-    QToolTip::hideText();
+    hoverViewportPos = event->pos();
+    hoverGlobalPos = event->globalPosition().toPoint();
+    if (lspClient && lspClient->isInitialized()
+        && filePath.endsWith(".py", Qt::CaseInsensitive))
+        hoverTimer->start();
+    else
+        QToolTip::hideText();
 }
 
 void CodeEditor::loadFile(const QString &filepath)
@@ -725,6 +731,10 @@ void CodeEditor::loadFile(const QString &filepath)
 
     filePath = filepath;
     setModified(false);
+
+    if (lspClient && lspClient->isInitialized()
+        && filepath.endsWith(".py", Qt::CaseInsensitive))
+        lspClient->didOpen(filepath, text());
 }
 
 void CodeEditor::saveFile(const QString &filepath)
@@ -1402,4 +1412,163 @@ void CodeEditor::applyDiffText(const QString &raw)
             pendingDelLineNos.clear();
         }
     }
+}
+
+void CodeEditor::setLspClient(LspClient *client)
+{
+    if (lspClient)
+        disconnect(lspClient, nullptr, this, nullptr);
+    lspClient = client;
+    if (!lspClient)
+        return;
+
+    connect(lspClient, &LspClient::completionReady, this, &CodeEditor::onCompletionReady);
+    connect(lspClient, &LspClient::hoverReady, this, &CodeEditor::onHoverReady);
+
+    connect(lspClient, &LspClient::initialized, this, [this]() {
+        if (!filePath.isEmpty() && filePath.endsWith(".py", Qt::CaseInsensitive))
+            lspClient->didOpen(filePath, text());
+    });
+
+    if (!filePath.isEmpty() && lspClient->isInitialized()
+        && filePath.endsWith(".py", Qt::CaseInsensitive))
+        lspClient->didOpen(filePath, text());
+}
+
+void CodeEditor::notifyLspChange()
+{
+    if (!lspClient || !lspClient->isRunning() || filePath.isEmpty())
+        return;
+    if (!filePath.endsWith(".py", Qt::CaseInsensitive))
+        return;
+    lspClient->didChange(filePath, text(), ++lspVersion);
+}
+
+void CodeEditor::requestLspCompletion()
+{
+    if (filePath.isEmpty() || applyingRemote)
+        return;
+    if (!filePath.endsWith(".py", Qt::CaseInsensitive))
+        return;
+    if (!lspClient || !lspClient->isInitialized())
+        return;
+    int line, col;
+    getCursorPosition(&line, &col);
+    lspClient->requestCompletion(filePath, line, col);
+}
+
+void CodeEditor::onCompletionReady(const QList<LspCompletionItem> &items)
+{
+    if (!hasFocus() && !viewport()->hasFocus())
+        return;
+
+    int line, col;
+    getCursorPosition(&line, &col);
+    const QString lineText = text(line);
+
+    int wordStart = col;
+    while (wordStart > 0
+           && (lineText[wordStart - 1].isLetterOrNumber() || lineText[wordStart - 1] == '_'))
+        --wordStart;
+    const QString prefix = lineText.mid(wordStart, col - wordStart);
+    const int wordLen = col - wordStart;
+
+    if (prefix.isEmpty()) {
+        SendScintilla(SCI_AUTOCCANCEL);
+        return;
+    }
+
+    QStringList filtered;
+    for (const LspCompletionItem &item : items) {
+        if (item.label.startsWith(prefix, Qt::CaseInsensitive))
+            filtered.append(item.label);
+    }
+
+    qDebug() << "[LSP] onCompletionReady items:" << items.size() << "prefix:" << prefix << "filtered:" << filtered.size();
+
+    if (filtered.isEmpty()) {
+        SendScintilla(SCI_AUTOCCANCEL);
+        return;
+    }
+
+    filtered.sort(Qt::CaseInsensitive);
+    filtered.removeDuplicates();
+
+    const QByteArray wordList = filtered.join(' ').toUtf8();
+    autocWordLen = wordLen;
+    qDebug() << "[LSP] SCI_AUTOCSHOW wordLen:" << wordLen << "items:" << filtered.size();
+    SendScintilla(SCI_AUTOCSHOW, (uintptr_t) wordLen, wordList.constData());
+}
+
+void CodeEditor::onHoverTimeout()
+{
+    if (!lspClient || !lspClient->isInitialized() || filePath.isEmpty())
+        return;
+    const int sciPos = (int) SendScintilla(SCI_POSITIONFROMPOINT,
+                                           hoverViewportPos.x(),
+                                           hoverViewportPos.y());
+    int line, col;
+    lineIndexFromPosition(sciPos, &line, &col);
+    lspClient->requestHover(filePath, line, col);
+}
+
+static QString hoverToHtml(const QString &md)
+{
+    enum State { Text, Code };
+    State state = Text;
+    QStringList codeLines, textLines;
+
+    for (const QString &raw : md.split('\n')) {
+        if (raw.trimmed().startsWith("```")) {
+            state = (state == Text) ? Code : Text;
+            continue;
+        }
+        if (state == Code)
+            codeLines << raw.toHtmlEscaped();
+        else if (!raw.trimmed().isEmpty())
+            textLines << raw.toHtmlEscaped();
+    }
+
+    QString html;
+    if (!codeLines.isEmpty())
+        html += "<code style='font-family:monospace;color:#9cdcfe;white-space:pre'>"
+                + codeLines.join("<br>") + "</code>";
+    if (!textLines.isEmpty()) {
+        if (!html.isEmpty())
+            html += "<hr style='border:0;border-top:1px solid #555;margin:4px 0'>";
+        html += "<span style='color:#d4d4d4'>" + textLines.join("<br>") + "</span>";
+    }
+    return html.isEmpty() ? md.toHtmlEscaped() : html;
+}
+
+void CodeEditor::onHoverReady(const QString &content)
+{
+    if (!hasFocus() && !viewport()->hasFocus())
+        return;
+    const QString html = "<div style='background:#252526;padding:6px 8px;border:1px solid #454545'>"
+                         + hoverToHtml(content) + "</div>";
+    QToolTip::showText(hoverGlobalPos, html, this);
+}
+
+void CodeEditor::onAutoCompleted(const char *sel, int pos, int /*ch*/, int /*method*/)
+{
+    lspCompleteTimer->stop();
+
+    if (!collabActive || autocWordLen == 0)
+        return;
+
+    const QByteArray selBytes(sel);
+    const QString selText = QString::fromUtf8(selBytes);
+
+    emit beginUndoGroup();
+    for (int i = 0; i < autocWordLen; ++i)
+        emit localDelete(pos);
+    int insertPos = pos;
+    for (const QChar c : selText) {
+        emit localInsert(insertPos, c);
+        insertPos += QString(c).toUtf8().size();
+    }
+    emit endUndoGroup();
+    shiftRemoteCursors(pos, selBytes.size() - autocWordLen);
+    autocWordLen = 0;
 }

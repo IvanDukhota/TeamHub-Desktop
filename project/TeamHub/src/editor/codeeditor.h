@@ -1,7 +1,6 @@
 #ifndef CODEEDITOR_H
 #define CODEEDITOR_H
 
-#include <Qsci/qsciapis.h>
 #include <Qsci/qscilexerpython.h>
 #include <Qsci/qsciscintilla.h>
 
@@ -14,6 +13,7 @@
 #include <QToolTip>
 #include <QWidget>
 
+#include "lspclient.h"
 #include "textsearch.h"
 
 class CodeEditor : public QsciScintilla
@@ -62,6 +62,7 @@ public:
     bool suppressLocalInsert = false;
 
 public slots:
+    void setLspClient(LspClient *client);
     void resetZoom();
     void undo();
     void redo();
@@ -107,6 +108,9 @@ protected:
     void resizeEvent(QResizeEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
 
+private slots:
+    void onAutoCompleted(const char *sel, int pos, int ch, int method);
+
 private:
     struct ErrorInfo
     {
@@ -135,12 +139,28 @@ private:
     void deleteSelection();
     void shiftRemoteCursors(int fromBytePos, int byteDelta, bool repaint = true);
 
+    void onCompletionReady(const QList<LspCompletionItem> &items);
+    void onHoverReady(const QString &content);
+    void onHoverTimeout();
+
+    void notifyLspChange();
+    void requestLspCompletion();
+
     void checkSyntax();
     void onLintFinished(int exitCode, QProcess::ExitStatus);
 
     static constexpr int ErrorIndicator = 8;
     static constexpr int SEARCH_INDICATOR = 9;
     static constexpr int CURRENT_SEARCH_INDICATOR = 10;
+
+    LspClient *lspClient = nullptr;
+    QTimer *lspChangeTimer = nullptr;
+    QTimer *lspCompleteTimer = nullptr;
+    QTimer *hoverTimer = nullptr;
+    int lspVersion = 1;
+    int autocWordLen = 0;
+    QPoint hoverViewportPos;
+    QPoint hoverGlobalPos;
 
     QString filePath;
     QsciLexerPython *lexer;

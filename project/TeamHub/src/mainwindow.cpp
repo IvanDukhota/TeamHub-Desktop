@@ -1511,6 +1511,9 @@ void MainWindow::openFileFromBrowser(const QString &path)
         newEditor->loadFile(path);
     }
 
+    if (lspClient)
+        newEditor->setLspClient(lspClient);
+
     connect(newEditor,
             &CodeEditor::cursorPositionUpdated,
             this,
@@ -2573,6 +2576,10 @@ void MainWindow::openProjectFolder(const QString &path)
     fileBrowser->setRootPath(path);
     clearTabs();
 
+    if (!lspClient)
+        lspClient = new LspClient(this);
+    lspClient->start(path);
+
     const QString name = QFileInfo(path).fileName();
     setWindowTitle(name);
     outputPane->appendPlainText("[TeamHub] Opened folder: " + path);
@@ -3366,6 +3373,27 @@ void MainWindow::closeTabAt(QTabWidget *tabs, int index)
     tabs->blockSignals(true);
     tabs->removeTab(index);
     tabs->blockSignals(false);
+
+    if (lspClient && lspClient->isInitialized()) {
+        const QString fp = tabEditor->getFilePath();
+        if (fp.endsWith(".py", Qt::CaseInsensitive)) {
+            bool openElsewhere = false;
+            for (QTabWidget *tw : allTabWidgets()) {
+                for (int i = 0; i < tw->count(); ++i) {
+                    auto *other = qobject_cast<CodeEditor *>(tw->widget(i));
+                    if (other && other != tabEditor && other->getFilePath() == fp) {
+                        openElsewhere = true;
+                        break;
+                    }
+                }
+                if (openElsewhere)
+                    break;
+            }
+            if (!openElsewhere)
+                lspClient->didClose(fp);
+        }
+    }
+
     tabEditor->deleteLater();
 
     updateWelcomeVisibility();

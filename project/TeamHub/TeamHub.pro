@@ -37,6 +37,7 @@ win32 {
 }
 
 SOURCES += \
+    src/editor/lspclient.cpp \
     src/auth/authmanager.cpp \
     src/auth/authdialog.cpp \
     src/avatar/avatar.cpp \
@@ -62,6 +63,7 @@ SOURCES += \
     src/voicechat/voicechat.cpp
 
 HEADERS += \
+    src/editor/lspclient.h \
     src/auth/authmanager.h \
     src/auth/authdialog.h \
     src/avatar/avatar.h \

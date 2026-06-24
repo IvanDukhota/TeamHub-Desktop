@@ -147,6 +147,9 @@ private:
     int currentProjectId = -1;
     QString currentProjectPath;
 
+    // LSP
+    LspClient *lspClient = nullptr;
+
     // Auth
     AuthManager *auth = nullptr;
     QToolButton *btnProfile = nullptr;
