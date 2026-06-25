@@ -4,8 +4,8 @@
 #include <Qsci/qscicommandset.h>
 
 #include <QClipboard>
-#include <QDebug>
 #include <QColor>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFont>
@@ -17,6 +17,7 @@
 #include <QScrollBar>
 #include <QTextCursor>
 #include <QTextStream>
+#include <algorithm>
 
 class RemoteCursorOverlay : public QWidget
 {
@@ -35,6 +36,28 @@ public:
 
 protected:
     void paintEvent(QPaintEvent *) override { ed->paintRemoteCursors(this); }
+
+private:
+    CodeEditor *ed;
+};
+
+class ScrollOverviewRuler : public QWidget
+{
+public:
+    explicit ScrollOverviewRuler(QScrollBar *sb, CodeEditor *editor)
+        : QWidget(sb)
+        , ed(editor)
+    {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+        setAutoFillBackground(false);
+        setGeometry(sb->rect());
+        show();
+        raise();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override { ed->paintScrollOverview(this); }
 
 private:
     CodeEditor *ed;
@@ -168,6 +191,15 @@ void CodeEditor::setupMargins()
     markerDefine(QsciScintilla::Background, MARKER_DIFF_HUNK);
     setMarkerBackgroundColor(QColor("#1e2a3a"), MARKER_DIFF_HUNK);
 
+    setMarginType(3, QsciScintilla::SymbolMargin);
+    setMarginWidth(3, 3);
+    setMarginSensitivity(3, false);
+    setMarginMarkerMask(3, (1 << MARKER_CHANGE_ADDED) | (1 << MARKER_CHANGE_MODIFIED));
+    markerDefine(QsciScintilla::FullRectangle, MARKER_CHANGE_ADDED);
+    setMarkerBackgroundColor(QColor("#3fb950"), MARKER_CHANGE_ADDED);
+    markerDefine(QsciScintilla::FullRectangle, MARKER_CHANGE_MODIFIED);
+    setMarkerBackgroundColor(QColor("#e2c08d"), MARKER_CHANGE_MODIFIED);
+
     indicatorDefine(QsciScintilla::FullBoxIndicator, INDIC_DIFF_CHARS_ADDED);
     setIndicatorForegroundColor(QColor("#3fb950"), INDIC_DIFF_CHARS_ADDED);
     setIndicatorDrawUnder(true, INDIC_DIFF_CHARS_ADDED);
@@ -225,6 +257,15 @@ void CodeEditor::setupEditor()
             &QScrollBar::valueChanged,
             cursorOverlay,
             QOverload<>::of(&QWidget::update));
+
+    overviewRuler = new ScrollOverviewRuler(verticalScrollBar(), this);
+    verticalScrollBar()->installEventFilter(this);
+
+    overviewTimer = new QTimer(this);
+    overviewTimer->setSingleShot(true);
+    overviewTimer->setInterval(200);
+    connect(overviewTimer, &QTimer::timeout, this, &CodeEditor::updateOverviewMarks);
+    connect(this, SIGNAL(textChanged()), overviewTimer, SLOT(start()));
 }
 
 void CodeEditor::onCursorChanged(int line, int index)
@@ -374,6 +415,10 @@ void CodeEditor::keyPressEvent(QKeyEvent *event)
         }
 
         if (key == Qt::Key_Tab && mod == Qt::NoModifier) {
+            if (SendScintilla(SCI_AUTOCACTIVE)) {
+                QsciScintilla::keyPressEvent(event);
+                return;
+            }
             const int pos = (int) SendScintilla(SCI_GETCURRENTPOS);
             const int lenBefore = (int) SendScintilla(SCI_GETLENGTH);
             suppressLocalInsert = true;
@@ -571,6 +616,9 @@ void CodeEditor::setupLinter()
     indicatorDefine(QsciScintilla::SquiggleIndicator, ErrorIndicator);
     setIndicatorForegroundColor(QColor("#f44747"), ErrorIndicator);
 
+    indicatorDefine(QsciScintilla::SquiggleIndicator, WarningIndicator);
+    setIndicatorForegroundColor(QColor("#e2c08d"), WarningIndicator);
+
     indicatorDefine(QsciScintilla::BoxIndicator, SEARCH_INDICATOR);
     setIndicatorForegroundColor(QColor("#d7ba7d"), SEARCH_INDICATOR);
     setIndicatorOutlineColor(QColor("#d7ba7d"), SEARCH_INDICATOR);
@@ -586,6 +634,9 @@ void CodeEditor::setupLinter()
 
 void CodeEditor::checkSyntax()
 {
+    if (filePath.isEmpty() || !filePath.endsWith(".py", Qt::CaseInsensitive))
+        return;
+
     if (lintProcess) {
         if (lintProcess->state() != QProcess::NotRunning) {
             lintProcess->kill();
@@ -596,6 +647,7 @@ void CodeEditor::checkSyntax()
     }
 
     clearIndicatorRange(0, 0, lines(), 0, ErrorIndicator);
+    clearIndicatorRange(0, 0, lines(), 0, WarningIndicator);
 
     QString tmpPath = QDir::tempPath() + "/teamhub_lint_tmp.py";
     QFile tmpFile(tmpPath);
@@ -651,7 +703,7 @@ void CodeEditor::onLintFinished(int exitCode, QProcess::ExitStatus status)
     if (combined.isEmpty())
         return;
 
-    static const QRegularExpression re(R"([^:]+:(\d+):(\d+):\s*([\w-]+(?:\d*):\s*.+))");
+    static const QRegularExpression re(R"(:(\d+):(\d+):\s*([A-Z]\d+\s+.+))");
 
     for (const QString &rawLine : combined.split('\n')) {
         const QString line = rawLine.trimmed();
@@ -670,10 +722,13 @@ void CodeEditor::onLintFinished(int exitCode, QProcess::ExitStatus status)
             continue;
 
         const int len = std::max(1, lineLength(ln) - col - 1);
-        fillIndicatorRange(ln, col, ln, col + len, ErrorIndicator);
+        const int indic = msg.startsWith('W') ? WarningIndicator : ErrorIndicator;
+        fillIndicatorRange(ln, col, ln, col + len, indic);
 
         errorList.append({ln, col, msg});
     }
+
+    updateOverviewMarks();
 }
 
 void CodeEditor::mouseMoveEvent(QMouseEvent *event)
@@ -682,9 +737,17 @@ void CodeEditor::mouseMoveEvent(QMouseEvent *event)
 
     const int pos = SendScintilla(SCI_POSITIONFROMPOINT, event->pos().x(), event->pos().y());
 
+    const int lineNo = (int) SendScintilla(SCI_LINEFROMPOSITION, (ulong) pos);
+    const int lineEnd = (int) SendScintilla(SCI_GETLINEENDPOSITION, (ulong) lineNo);
+    if (pos >= lineEnd) {
+        hoverTimer->stop();
+        QToolTip::hideText();
+        return;
+    }
+
     const int indicators = SendScintilla(SCI_INDICATORALLONFOR, pos);
 
-    if (indicators & (1 << ErrorIndicator)) {
+    if (indicators & ((1 << ErrorIndicator) | (1 << WarningIndicator))) {
         int line, col;
         lineIndexFromPosition(pos, &line, &col);
 
@@ -711,11 +774,26 @@ void CodeEditor::mouseMoveEvent(QMouseEvent *event)
 
     hoverViewportPos = event->pos();
     hoverGlobalPos = event->globalPosition().toPoint();
-    if (lspClient && lspClient->isInitialized()
-        && filePath.endsWith(".py", Qt::CaseInsensitive))
+    if (lspClient && lspClient->isInitialized() && filePath.endsWith(".py", Qt::CaseInsensitive))
         hoverTimer->start();
     else
         QToolTip::hideText();
+}
+
+void CodeEditor::leaveEvent(QEvent *event)
+{
+    QsciScintilla::leaveEvent(event);
+    hoverTimer->stop();
+    QToolTip::hideText();
+}
+
+bool CodeEditor::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == verticalScrollBar() && event->type() == QEvent::Resize) {
+        if (overviewRuler)
+            overviewRuler->setGeometry(verticalScrollBar()->rect());
+    }
+    return QsciScintilla::eventFilter(obj, event);
 }
 
 void CodeEditor::loadFile(const QString &filepath)
@@ -732,9 +810,14 @@ void CodeEditor::loadFile(const QString &filepath)
     filePath = filepath;
     setModified(false);
 
-    if (lspClient && lspClient->isInitialized()
-        && filepath.endsWith(".py", Qt::CaseInsensitive))
+    if (lspClient && lspClient->isInitialized() && filepath.endsWith(".py", Qt::CaseInsensitive))
         lspClient->didOpen(filepath, text());
+
+    savedLines = text().split('\n');
+    updateOverviewMarks();
+
+    if (filepath.endsWith(".py", Qt::CaseInsensitive))
+        QTimer::singleShot(200, this, &CodeEditor::checkSyntax);
 }
 
 void CodeEditor::saveFile(const QString &filepath)
@@ -750,6 +833,8 @@ void CodeEditor::saveFile(const QString &filepath)
 
     filePath = filepath;
     setModified(false);
+    savedLines = text().split('\n');
+    updateOverviewMarks();
     emit fileSaved();
 }
 
@@ -1484,7 +1569,8 @@ void CodeEditor::onCompletionReady(const QList<LspCompletionItem> &items)
             filtered.append(item.label);
     }
 
-    qDebug() << "[LSP] onCompletionReady items:" << items.size() << "prefix:" << prefix << "filtered:" << filtered.size();
+    qDebug() << "[LSP] onCompletionReady items:" << items.size() << "prefix:" << prefix
+             << "filtered:" << filtered.size();
 
     if (filtered.isEmpty()) {
         SendScintilla(SCI_AUTOCCANCEL);
@@ -1571,4 +1657,138 @@ void CodeEditor::onAutoCompleted(const char *sel, int pos, int /*ch*/, int /*met
     emit endUndoGroup();
     shiftRemoteCursors(pos, selBytes.size() - autocWordLen);
     autocWordLen = 0;
+}
+
+void CodeEditor::updateOverviewMarks()
+{
+    markerDeleteAll(MARKER_CHANGE_ADDED);
+    markerDeleteAll(MARKER_CHANGE_MODIFIED);
+    overviewMarks.clear();
+
+    const QStringList cur = text().split('\n');
+    const int m = savedLines.size();
+    const int n = cur.size();
+
+    struct LineInfo
+    {
+        int lineNum;
+        QString content;
+    };
+    QVector<LineInfo> savedNE, curNE;
+    savedNE.reserve(m);
+    curNE.reserve(n);
+    for (int i = 0; i < m; ++i)
+        if (!savedLines[i].trimmed().isEmpty())
+            savedNE.append({i, savedLines[i]});
+    for (int j = 0; j < n; ++j)
+        if (!cur[j].trimmed().isEmpty())
+            curNE.append({j, cur[j]});
+
+    const int sm = savedNE.size();
+    const int sn = curNE.size();
+
+    if (sm > 3000 || sn > 3000) {
+        for (int i = 0; i < qMin(sm, sn); ++i) {
+            if (curNE[i].content != savedNE[i].content)
+                markerAdd(curNE[i].lineNum, MARKER_CHANGE_MODIFIED);
+        }
+        for (int i = sm; i < sn; ++i)
+            markerAdd(curNE[i].lineNum, MARKER_CHANGE_ADDED);
+    } else {
+        QVector<QVector<int>> dp(sm + 1, QVector<int>(sn + 1, 0));
+        for (int i = 1; i <= sm; ++i)
+            for (int j = 1; j <= sn; ++j)
+                dp[i][j] = (savedNE[i - 1].content == curNE[j - 1].content)
+                               ? dp[i - 1][j - 1] + 1
+                               : qMax(dp[i - 1][j], dp[i][j - 1]);
+
+        struct Op
+        {
+            enum Kind { Equal, Del, Ins } kind;
+            int ci;
+        };
+        QVector<Op> ops;
+        ops.reserve(sm + sn);
+        {
+            int i = sm, j = sn;
+            while (i > 0 || j > 0) {
+                if (i > 0 && j > 0 && savedNE[i - 1].content == curNE[j - 1].content) {
+                    ops.append({Op::Equal, curNE[j - 1].lineNum});
+                    --i;
+                    --j;
+                } else if (j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+                    ops.append({Op::Ins, curNE[j - 1].lineNum});
+                    --j;
+                } else {
+                    ops.append({Op::Del, -1});
+                    --i;
+                }
+            }
+            std::reverse(ops.begin(), ops.end());
+        }
+
+        int k = 0;
+        while (k < ops.size()) {
+            if (ops[k].kind == Op::Equal) {
+                ++k;
+                continue;
+            }
+            const int start = k;
+            bool hasDel = false;
+            while (k < ops.size() && ops[k].kind != Op::Equal) {
+                if (ops[k].kind == Op::Del)
+                    hasDel = true;
+                ++k;
+            }
+            for (int x = start; x < k; ++x) {
+                if (ops[x].kind != Op::Ins)
+                    continue;
+                const int lineNum = ops[x].ci;
+                const bool wasNew = lineNum >= m || savedLines[lineNum].trimmed().isEmpty();
+                const int marker = (hasDel && !wasNew) ? MARKER_CHANGE_MODIFIED
+                                                       : MARKER_CHANGE_ADDED;
+                markerAdd(lineNum, marker);
+            }
+        }
+    }
+
+    for (const ErrorInfo &err : std::as_const(errorList)) {
+        const OverviewMark::Type t = err.message.startsWith('W') ? OverviewMark::Warning
+                                                                 : OverviewMark::Error;
+        overviewMarks.append({err.line, t});
+    }
+    if (overviewRuler)
+        overviewRuler->update();
+}
+
+void CodeEditor::paintScrollOverview(QWidget *ruler)
+{
+    const int total = lines();
+    if (total <= 0 || overviewMarks.isEmpty())
+        return;
+
+    const int h = ruler->height();
+    QPainter p(ruler);
+
+    QVector<OverviewMark> sorted = overviewMarks;
+    std::sort(sorted.begin(), sorted.end(), [](const OverviewMark &a, const OverviewMark &b) {
+        return a.line < b.line;
+    });
+
+    int i = 0;
+    while (i < sorted.size()) {
+        const OverviewMark::Type type = sorted[i].type;
+        int rangeStart = sorted[i].line;
+        int rangeEnd = rangeStart;
+        while (i + 1 < sorted.size() && sorted[i + 1].type == type
+               && sorted[i + 1].line == rangeEnd + 1) {
+            ++i;
+            rangeEnd = sorted[i].line;
+        }
+        const QColor col = (type == OverviewMark::Error) ? QColor("#f14c4c") : QColor("#e2c08d");
+        const int y1 = rangeStart * h / total;
+        const int y2 = qMin(h, (rangeEnd + 1) * h / total);
+        p.fillRect(0, y1, ruler->width(), qMax(1, y2 - y1), col);
+        ++i;
+    }
 }

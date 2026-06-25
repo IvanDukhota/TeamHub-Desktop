@@ -29,6 +29,8 @@ public:
     static constexpr int MARKER_DIFF_ADDED = 3;
     static constexpr int MARKER_DIFF_REMOVED = 4;
     static constexpr int MARKER_DIFF_HUNK = 5;
+    static constexpr int MARKER_CHANGE_ADDED = 6;
+    static constexpr int MARKER_CHANGE_MODIFIED = 7;
     static constexpr int INDIC_DIFF_CHARS_ADDED = 8;
     static constexpr int INDIC_DIFF_CHARS_REMOVED = 9;
 
@@ -56,6 +58,8 @@ public:
     void applyDiffText(const QString &raw);
     void clearDiffMarkers();
     const QSet<int> &breakpoints() const { return breakpointSet; }
+
+    void paintScrollOverview(QWidget *ruler);
 
     bool applyingRemote = false;
     bool collabActive = false;
@@ -107,6 +111,8 @@ protected:
     void keyPressEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
 private slots:
     void onAutoCompleted(const char *sel, int pos, int ch, int method);
@@ -150,8 +156,20 @@ private:
     void onLintFinished(int exitCode, QProcess::ExitStatus);
 
     static constexpr int ErrorIndicator = 8;
+    static constexpr int WarningIndicator = 11;
     static constexpr int SEARCH_INDICATOR = 9;
     static constexpr int CURRENT_SEARCH_INDICATOR = 10;
+
+    struct OverviewMark
+    {
+        int line;
+        enum Type { Error, Warning } type;
+    };
+    QVector<OverviewMark> overviewMarks;
+    QStringList savedLines;
+    QWidget *overviewRuler = nullptr;
+    QTimer *overviewTimer = nullptr;
+    void updateOverviewMarks();
 
     LspClient *lspClient = nullptr;
     QTimer *lspChangeTimer = nullptr;

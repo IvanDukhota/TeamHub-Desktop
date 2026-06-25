@@ -35,7 +35,7 @@ public:
         case 'M': col = QColor("#e2c08d"); break;
         case 'A': col = QColor("#4ec9b0"); break;
         case 'D': col = QColor("#f14c4c"); break;
-        case '?': col = QColor("#7ab8f5"); break;
+        case 'U': col = QColor("#7ab8f5"); break;
         case 'R': col = QColor("#b5cea8"); break;
         default: return;
         }
@@ -287,7 +287,7 @@ void FileBrowser::refreshGitStatus()
             auto priority = [](QChar c) -> int {
                 switch (c.toLatin1()) {
                 case 'D': return 5; case 'M': return 4; case 'A': return 3;
-                case 'R': return 2; case '?': return 1; default: return 0;
+                case 'R': return 2; case 'U': return 1; default: return 0;
                 }
             };
             const QString out = QString::fromUtf8(gitStatusProc->readAllStandardOutput());
@@ -295,7 +295,7 @@ void FileBrowser::refreshGitStatus()
                 if (line.size() < 4) continue;
                 const QChar X = line[0], Y = line[1];
                 QChar sc;
-                if (X == '?' && Y == '?') sc = '?';
+                if (X == '?' && Y == '?') sc = 'U';
                 else if (Y != ' ') sc = Y;
                 else sc = X;
                 if (sc == ' ') continue;
