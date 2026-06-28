@@ -1684,7 +1684,6 @@ void CodeEditor::applyFoldStyle(bool dark)
     const QColor arrowFg = dark ? QColor("#606060") : QColor("#aaaaaa");
     const QColor marginBg = dark ? QColor("#1e1e1e") : QColor("#f3f3f3");
 
-    // Closed header ▶ / open header ▼
     SendScintilla(SCI_MARKERDEFINE, SC_MARKNUM_FOLDER, SC_MARK_ARROW);
     SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDER, arrowFg);
     SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDER, marginBg);
@@ -1693,7 +1692,6 @@ void CodeEditor::applyFoldStyle(bool dark)
     SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDEROPEN, arrowFg);
     SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDEROPEN, marginBg);
 
-    // Nested fold end markers — same arrows
     SendScintilla(SCI_MARKERDEFINE, SC_MARKNUM_FOLDEREND, SC_MARK_ARROW);
     SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDEREND, arrowFg);
     SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDEREND, marginBg);
@@ -1702,14 +1700,11 @@ void CodeEditor::applyFoldStyle(bool dark)
     SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDEROPENMID, arrowFg);
     SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDEROPENMID, marginBg);
 
-    // Body/tail markers — invisible (no lines through body, clean VS Code look)
     for (int m : {SC_MARKNUM_FOLDERSUB, SC_MARKNUM_FOLDERMIDTAIL, SC_MARKNUM_FOLDERTAIL}) {
         SendScintilla(SCI_MARKERDEFINE, m, SC_MARK_EMPTY);
         SendScintilla(SCI_MARKERSETBACK, m, marginBg);
     }
 
-    // Clear fold flags — prevent the default black line that QsciScintilla/Scintilla
-    // draws after contracted folds (SC_FOLDFLAG_LINEAFTER_CONTRACTED causes it)
     SendScintilla(SCI_SETFOLDFLAGS, 0);
 }
 

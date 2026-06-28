@@ -65,7 +65,7 @@ QString djangoBaseUrl()
 
 QString rgaServerUrl()
 {
-    return envOr("RGA_SERVER_URL", "ws://localhost:8765");
+    return envOr("RGA_SERVER_URL", "ws://localhost:8000/ws/collab");
 }
 
 QString voiceServerHost()
@@ -75,7 +75,7 @@ QString voiceServerHost()
 
 quint16 voiceServerPort()
 {
-    return static_cast<quint16>(envOr("VOICE_SERVER_PORT", "9000").toUShort());
+    return static_cast<quint16>(envOr("VOICE_SERVER_PORT", "8000").toUShort());
 }
 
 }

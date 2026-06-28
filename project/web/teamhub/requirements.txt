@@ -1,0 +1,8 @@
+django>=4.2,<5.0
+djangorestframework
+daphne>=4.0
+channels>=4.0
+channels-redis>=4.0
+redis>=5.0
+google-genai>=2.8.0
+Pillow

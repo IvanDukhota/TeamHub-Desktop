@@ -104,7 +104,7 @@ void VoiceChat::connectToServer(const QString &host, quint16 port)
     if (host == "localhost" || host == "127.0.0.1") {
         publicIp = "127.0.0.1";
         publicPort = udpSocket->localPort();
-        webSocket->open(QUrl(QString("ws://%1:%2").arg(host).arg(port)));
+        webSocket->open(QUrl(QString("ws://%1:%2/ws/voice").arg(host).arg(port)));
         return;
     }
 
@@ -311,7 +311,7 @@ void VoiceChat::parseStunResponse(const QByteArray &data)
 
     webSocket->abort();
 
-    webSocket->open(QUrl(QString("ws://%1:%2").arg(serverHost).arg(serverPort)));
+    webSocket->open(QUrl(QString("ws://%1:%2/ws/voice").arg(serverHost).arg(serverPort)));
 }
 
 void VoiceChat::onStunTimeout()
@@ -350,7 +350,7 @@ void VoiceChat::onStunTimeout()
 
     webSocket->abort();
 
-    webSocket->open(QUrl(QString("ws://%1:%2").arg(serverHost).arg(serverPort)));
+    webSocket->open(QUrl(QString("ws://%1:%2/ws/voice").arg(serverHost).arg(serverPort)));
 }
 
 void VoiceChat::onWebSocketConnected()
