@@ -240,6 +240,13 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *event)
         }
     }
     if (event->type() == QEvent::MouseButtonPress) {
+        const QVariant siteIdVar = obj->property("presenceSiteId");
+        if (siteIdVar.isValid() && editor) {
+            const int pos = editor->remoteCursorPos(siteIdVar.toInt());
+            if (pos >= 0)
+                editor->goToScintillaPos(pos);
+            return true;
+        }
         const QString path = obj->property("recentPath").toString();
         if (!path.isEmpty()) {
             if (QFileInfo::exists(path))
@@ -678,6 +685,7 @@ void MainWindow::startCollab(const QString &room,
             &CollabSession::sessionAiInsightsReady,
             this,
             &MainWindow::onSessionAiInsightsReady);
+    connect(session, &CollabSession::remoteOpReceived, this, &MainWindow::onRemoteOpReceived);
     connect(session, &CollabSession::peerRoleChanged, this, [this](int siteId, const QString &role) {
         peerRoles[siteId] = role;
         refreshCollabUsersList();
@@ -740,6 +748,11 @@ void MainWindow::startCollab(const QString &room,
                 });
             }
             sessionTimer->start(1000);
+            if (!metricsRefreshTimer) {
+                metricsRefreshTimer = new QTimer(this);
+                metricsRefreshTimer->setSingleShot(true);
+                connect(metricsRefreshTimer, &QTimer::timeout, this, &MainWindow::refreshCollabUsersList);
+            }
             showToast("Collab session started", "success");
             const QString path = editor ? editor->getFilePath() : QString();
             if (!path.isEmpty()) {
@@ -799,6 +812,7 @@ void MainWindow::joinCollab()
             &CollabSession::sessionAiInsightsReady,
             this,
             &MainWindow::onSessionAiInsightsReady);
+    connect(session, &CollabSession::remoteOpReceived, this, &MainWindow::onRemoteOpReceived);
     connect(session, &CollabSession::peerRoleChanged, this, [this](int siteId, const QString &role) {
         peerRoles[siteId] = role;
         refreshCollabUsersList();
@@ -874,6 +888,12 @@ void MainWindow::joinCollab()
                 });
             }
             sessionTimer->start(1000);
+            if (!metricsRefreshTimer) {
+                metricsRefreshTimer = new QTimer(this);
+                metricsRefreshTimer->setSingleShot(true);
+                connect(metricsRefreshTimer, &QTimer::timeout, this, &MainWindow::refreshCollabUsersList);
+            }
+            sessionTimer->start(1000);
             showToast("Joined collab session", "success");
         },
         Qt::SingleShotConnection);
@@ -884,6 +904,9 @@ void MainWindow::joinCollab()
 
 void MainWindow::wireEditorToManager(CodeEditor *ed, RGAManager *mgr)
 {
+    if (editorToMgr.value(ed) == mgr)
+        return;
+
     connect(ed, &CodeEditor::localInsert, mgr, &RGAManager::localInsert, Qt::UniqueConnection);
     connect(ed, &CodeEditor::localDelete, mgr, &RGAManager::localRemove, Qt::UniqueConnection);
     connect(ed, &CodeEditor::undoRequested, mgr, &RGAManager::undo, Qt::UniqueConnection);
@@ -921,6 +944,12 @@ void MainWindow::wireEditorToManager(CodeEditor *ed, RGAManager *mgr)
             ed,
             &CodeEditor::removeRemoteCursor,
             Qt::UniqueConnection);
+
+    connect(ed, &CodeEditor::peerLabelClicked, ed, [ed](int siteId) {
+        const int pos = ed->remoteCursorPos(siteId);
+        if (pos >= 0)
+            ed->goToScintillaPos(pos);
+    });
 }
 
 void MainWindow::wireEditorToSession(CodeEditor *ed, const QString &relPath)
@@ -1015,6 +1044,14 @@ void MainWindow::stopAllCollab()
     peerNames.clear();
     peerAvatars.clear();
     peerRoles.clear();
+    peerInserts.clear();
+    peerDeletes.clear();
+    peerTyping.clear();
+    for (auto *t : typingTimers)
+        t->deleteLater();
+    typingTimers.clear();
+    if (metricsRefreshTimer)
+        metricsRefreshTimer->stop();
     currentCollabFile.clear();
     refreshPresenceBar();
 
@@ -1054,15 +1091,24 @@ void MainWindow::markTabAsCollab(CodeEditor *ed, bool on)
 QWidget *MainWindow::makeCollabUserRow(int id,
                                        const QString &label,
                                        const QString &avatarUrl,
-                                       const QString &role)
+                                       const QString &role,
+                                       int inserts,
+                                       int deletes,
+                                       bool typing)
 {
     auto *row = new QWidget;
     row->setStyleSheet("background: transparent;");
     auto *h = new QHBoxLayout(row);
-    h->setContentsMargins(6, 3, 6, 3);
-    h->setSpacing(8);
+    h->setContentsMargins(6, 2, 6, 2);
+    h->setSpacing(6);
 
-    const int size = 24;
+    auto *dot = new QLabel("●");
+    dot->setFixedWidth(10);
+    dot->setStyleSheet(typing ? "color: #4ec9b0; font-size: 8px;"
+                              : "color: transparent; font-size: 8px;");
+    h->addWidget(dot);
+
+    const int size = 22;
     auto *avatar = new QLabel;
     avatar->setFixedSize(size, size);
     const QPixmap fallback = Avatar::letterPixmap(Avatar::initialFor(label),
@@ -1077,11 +1123,22 @@ QWidget *MainWindow::makeCollabUserRow(int id,
     nameLbl->setStyleSheet("color: #d4d4d4; font-size: 12px;");
     h->addWidget(nameLbl, 1);
 
+    if (inserts > 0 || deletes > 0) {
+        auto *cntLbl = new QLabel(
+            QString("<span style='color:#4ec9b0;'>↑%1</span>"
+                    "<span style='color:#666666;'> ↓%2</span>")
+                .arg(inserts)
+                .arg(deletes));
+        cntLbl->setTextFormat(Qt::RichText);
+        cntLbl->setStyleSheet("font-size: 10px;");
+        h->addWidget(cntLbl);
+    }
+
     if (!role.isEmpty()) {
-        const QString label_ = (role == "host") ? "Host" : (role == "write" ? "Write" : "Read");
-        auto *pill = new QLabel(label_);
+        const QString roleText = (role == "host") ? "Host" : (role == "write" ? "Write" : "Read");
+        auto *pill = new QLabel(roleText);
         pill->setStyleSheet("background: #3c3c3c; color: #aaaaaa; border-radius: 8px; "
-                            "padding: 1px 8px; font-size: 10px;");
+                            "padding: 1px 7px; font-size: 10px;");
         h->addWidget(pill);
     }
 
@@ -1110,7 +1167,10 @@ void MainWindow::refreshCollabUsersList()
                                        makeCollabUserRow(id,
                                                          label,
                                                          peerAvatars.value(id),
-                                                         peerRoles.value(id)));
+                                                         peerRoles.value(id),
+                                                         peerInserts.value(id, 0),
+                                                         peerDeletes.value(id, 0),
+                                                         peerTyping.value(id, false)));
     }
 }
 
@@ -1172,6 +1232,35 @@ void MainWindow::onRemoteFileFocusChanged(int siteId, const QString &file)
     refreshPresenceBar();
 }
 
+void MainWindow::onRemoteOpReceived(int siteId, const QString &opType)
+{
+    if (opType == "insert")
+        peerInserts[siteId]++;
+    else if (opType == "delete")
+        peerDeletes[siteId]++;
+
+    if (opType == "insert") {
+        peerTyping[siteId] = true;
+        if (typingTimers.contains(siteId)) {
+            typingTimers[siteId]->start(2000);
+        } else {
+            auto *t = new QTimer(this);
+            t->setSingleShot(true);
+            connect(t, &QTimer::timeout, this, [this, siteId]() {
+                peerTyping.remove(siteId);
+                typingTimers.remove(siteId);
+                if (metricsRefreshTimer)
+                    metricsRefreshTimer->start(50);
+            });
+            typingTimers[siteId] = t;
+            t->start(2000);
+        }
+    }
+
+    if (metricsRefreshTimer)
+        metricsRefreshTimer->start(150);
+}
+
 void MainWindow::refreshPresenceBar()
 {
     if (!mainToolBar)
@@ -1204,15 +1293,21 @@ void MainWindow::refreshPresenceBar()
                                 ? (auth ? auth->currentUser().avatarUrl : QString())
                                 : peerAvatars.value(id);
 
+        const QPixmap fallback = Avatar::letterPixmap(Avatar::initialFor(name),
+                                                      Avatar::colorForId(QString::number(id)),
+                                                      inner);
+
         auto *lbl = new QLabel(mainToolBar);
         lbl->setFixedSize(S, S);
         lbl->setToolTip(name);
         lbl->setAlignment(Qt::AlignCenter);
-
-        const QPixmap fallback = Avatar::letterPixmap(Avatar::initialFor(name),
-                                                      Avatar::colorForId(QString::number(id)),
-                                                      inner);
         lbl->setPixmap(Avatar::circularPixmap(fallback, S));
+
+        if (id != session->siteId()) {
+            lbl->setProperty("presenceSiteId", id);
+            lbl->setCursor(Qt::PointingHandCursor);
+            lbl->installEventFilter(this);
+        }
 
         QPointer<QLabel> ptr = lbl;
         Avatar::load(lbl, url, fallback, inner, [ptr](const QPixmap &pix) {
@@ -2266,6 +2361,11 @@ void MainWindow::onTabChanged(int index)
         currentFilePath.clear();
         statusFile->setText("");
         updateWindowTitle();
+        if (session && session->isConnected() && !currentCollabFile.isEmpty()) {
+            session->sendCursorLeave(currentCollabFile);
+            currentCollabFile.clear();
+            refreshPresenceBar();
+        }
         return;
     }
     editor = activeEditor;

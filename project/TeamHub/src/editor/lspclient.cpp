@@ -328,5 +328,7 @@ void LspClient::dispatch(const QJsonObject &msg)
         }
         qDebug() << "[LSP] completionReady, items:" << items.size();
         emit completionReady(items);
+        return;
     }
+
 }

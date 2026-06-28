@@ -320,6 +320,22 @@ QTabWidget#terminalTabs > QTabBar::tab:last {
     padding: 4px 8px;
 }
 
+QTabBar::close-button {
+    image: url(${ICONS_DIR}close.svg);
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    margin: 0 1px;
+    subcontrol-position: right;
+}
+QTabBar::close-button:hover {
+    image: url(${ICONS_DIR}close_hover.svg);
+    background: rgba(209, 52, 56, 0.25);
+}
+QTabBar::close-button:pressed {
+    background: rgba(209, 52, 56, 0.55);
+}
+
 QPushButton#voipBtn {
     background: #3c3c3c;
     color: #cccccc;

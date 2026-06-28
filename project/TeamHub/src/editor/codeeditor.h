@@ -29,10 +29,8 @@ public:
     static constexpr int MARKER_DIFF_ADDED = 3;
     static constexpr int MARKER_DIFF_REMOVED = 4;
     static constexpr int MARKER_DIFF_HUNK = 5;
-    static constexpr int MARKER_CHANGE_ADDED = 6;
-    static constexpr int MARKER_CHANGE_MODIFIED = 7;
-    static constexpr int INDIC_DIFF_CHARS_ADDED = 8;
-    static constexpr int INDIC_DIFF_CHARS_REMOVED = 9;
+    static constexpr int INDIC_DIFF_CHARS_ADDED = 12;
+    static constexpr int INDIC_DIFF_CHARS_REMOVED = 13;
 
     explicit CodeEditor(QWidget *parent = nullptr);
 
@@ -106,6 +104,7 @@ signals:
     void beginUndoGroup();
     void endUndoGroup();
     void breakpointsChanged(const QSet<int> &lines);
+    void peerLabelClicked(int siteId);
 
 protected:
     void keyPressEvent(QKeyEvent *event) override;
@@ -116,6 +115,16 @@ protected:
 
 private slots:
     void onAutoCompleted(const char *sel, int pos, int ch, int method);
+    void onScintillaModified(int pos,
+                             int mtype,
+                             const char *text,
+                             int len,
+                             int linesAdded,
+                             int line,
+                             int foldNow,
+                             int foldPrev,
+                             int token,
+                             int annotLines);
 
 private:
     struct ErrorInfo
@@ -128,6 +137,7 @@ private:
 
     QMap<int, int> remoteCursorPositions;
     QMap<int, QString> remoteCursorNames;
+    QMap<int, QRect> labelHitRects;
     QWidget *cursorOverlay = nullptr;
     static const QColor kCursorColors[4];
 
@@ -166,10 +176,10 @@ private:
         enum Type { Error, Warning } type;
     };
     QVector<OverviewMark> overviewMarks;
-    QStringList savedLines;
     QWidget *overviewRuler = nullptr;
     QTimer *overviewTimer = nullptr;
-    void updateOverviewMarks();
+    void updateScrollOverview();
+    void applyFoldStyle(bool dark);
 
     LspClient *lspClient = nullptr;
     QTimer *lspChangeTimer = nullptr;

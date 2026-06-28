@@ -115,6 +115,7 @@ void CodeEditor::setupLexer()
     lexer = new QsciLexerPython(this);
     applyDarkTheme();
     setLexer(lexer);
+    lexer->setFoldCompact(false);
     setUtf8(true);
 }
 
@@ -191,15 +192,6 @@ void CodeEditor::setupMargins()
     markerDefine(QsciScintilla::Background, MARKER_DIFF_HUNK);
     setMarkerBackgroundColor(QColor("#1e2a3a"), MARKER_DIFF_HUNK);
 
-    setMarginType(3, QsciScintilla::SymbolMargin);
-    setMarginWidth(3, 3);
-    setMarginSensitivity(3, false);
-    setMarginMarkerMask(3, (1 << MARKER_CHANGE_ADDED) | (1 << MARKER_CHANGE_MODIFIED));
-    markerDefine(QsciScintilla::FullRectangle, MARKER_CHANGE_ADDED);
-    setMarkerBackgroundColor(QColor("#3fb950"), MARKER_CHANGE_ADDED);
-    markerDefine(QsciScintilla::FullRectangle, MARKER_CHANGE_MODIFIED);
-    setMarkerBackgroundColor(QColor("#e2c08d"), MARKER_CHANGE_MODIFIED);
-
     indicatorDefine(QsciScintilla::FullBoxIndicator, INDIC_DIFF_CHARS_ADDED);
     setIndicatorForegroundColor(QColor("#3fb950"), INDIC_DIFF_CHARS_ADDED);
     setIndicatorDrawUnder(true, INDIC_DIFF_CHARS_ADDED);
@@ -233,8 +225,9 @@ void CodeEditor::setupEditor()
     setUnmatchedBraceBackgroundColor(QColor("#3a2020"));
     setUnmatchedBraceForegroundColor(QColor("#f44747"));
 
-    setFolding(QsciScintilla::BoxedTreeFoldStyle, 2);
+    setFolding(QsciScintilla::PlainFoldStyle, 2);
     setFoldMarginColors(QColor("#1e1e1e"), QColor("#1e1e1e"));
+    applyFoldStyle(true);
 
     setScrollWidth(1);
     setScrollWidthTracking(true);
@@ -263,9 +256,18 @@ void CodeEditor::setupEditor()
 
     overviewTimer = new QTimer(this);
     overviewTimer->setSingleShot(true);
-    overviewTimer->setInterval(200);
-    connect(overviewTimer, &QTimer::timeout, this, &CodeEditor::updateOverviewMarks);
+    overviewTimer->setInterval(150);
+    connect(overviewTimer, &QTimer::timeout, this, [this]() {
+        if (overviewRuler)
+            overviewRuler->update();
+    });
     connect(this, SIGNAL(textChanged()), overviewTimer, SLOT(start()));
+
+    connect(this,
+            SIGNAL(SCN_MODIFIED(int, int, const char *, int, int, int, int, int, int, int)),
+            this,
+            SLOT(onScintillaModified(int, int, const char *, int, int, int, int, int, int,
+                                     int)));
 }
 
 void CodeEditor::onCursorChanged(int line, int index)
@@ -615,13 +617,18 @@ void CodeEditor::setupLinter()
 {
     indicatorDefine(QsciScintilla::SquiggleIndicator, ErrorIndicator);
     setIndicatorForegroundColor(QColor("#f44747"), ErrorIndicator);
+    setIndicatorDrawUnder(false, ErrorIndicator);
+    SendScintilla(SCI_INDICSETALPHA, (unsigned long) ErrorIndicator, (long) 255);
 
     indicatorDefine(QsciScintilla::SquiggleIndicator, WarningIndicator);
     setIndicatorForegroundColor(QColor("#e2c08d"), WarningIndicator);
+    setIndicatorDrawUnder(false, WarningIndicator);
+    SendScintilla(SCI_INDICSETALPHA, (unsigned long) WarningIndicator, (long) 255);
 
     indicatorDefine(QsciScintilla::BoxIndicator, SEARCH_INDICATOR);
     setIndicatorForegroundColor(QColor("#d7ba7d"), SEARCH_INDICATOR);
     setIndicatorOutlineColor(QColor("#d7ba7d"), SEARCH_INDICATOR);
+    setIndicatorDrawUnder(false, SEARCH_INDICATOR);
 
     lintTimer = new QTimer(this);
     lintTimer->setSingleShot(true);
@@ -630,6 +637,7 @@ void CodeEditor::setupLinter()
     connect(lintTimer, &QTimer::timeout, this, &CodeEditor::checkSyntax);
 
     connect(this, SIGNAL(textChanged()), lintTimer, SLOT(start()));
+
 }
 
 void CodeEditor::checkSyntax()
@@ -728,7 +736,7 @@ void CodeEditor::onLintFinished(int exitCode, QProcess::ExitStatus status)
         errorList.append({ln, col, msg});
     }
 
-    updateOverviewMarks();
+    updateScrollOverview();
 }
 
 void CodeEditor::mouseMoveEvent(QMouseEvent *event)
@@ -793,6 +801,16 @@ bool CodeEditor::eventFilter(QObject *obj, QEvent *event)
         if (overviewRuler)
             overviewRuler->setGeometry(verticalScrollBar()->rect());
     }
+    if (obj == viewport() && event->type() == QEvent::MouseButtonPress) {
+        auto *me = static_cast<QMouseEvent *>(event);
+
+        for (auto it = labelHitRects.constBegin(); it != labelHitRects.constEnd(); ++it) {
+            if (it.value().contains(me->pos())) {
+                emit peerLabelClicked(it.key());
+                return true;
+            }
+        }
+    }
     return QsciScintilla::eventFilter(obj, event);
 }
 
@@ -813,9 +831,6 @@ void CodeEditor::loadFile(const QString &filepath)
     if (lspClient && lspClient->isInitialized() && filepath.endsWith(".py", Qt::CaseInsensitive))
         lspClient->didOpen(filepath, text());
 
-    savedLines = text().split('\n');
-    updateOverviewMarks();
-
     if (filepath.endsWith(".py", Qt::CaseInsensitive))
         QTimer::singleShot(200, this, &CodeEditor::checkSyntax);
 }
@@ -833,8 +848,7 @@ void CodeEditor::saveFile(const QString &filepath)
 
     filePath = filepath;
     setModified(false);
-    savedLines = text().split('\n');
-    updateOverviewMarks();
+
     emit fileSaved();
 }
 
@@ -936,6 +950,7 @@ void CodeEditor::applyDarkTheme()
     setMatchedBraceForegroundColor(QColor("#ffd700"));
     setUnmatchedBraceBackgroundColor(QColor("#3a2020"));
     setUnmatchedBraceForegroundColor(QColor("#f44747"));
+    applyFoldStyle(true);
 }
 
 void CodeEditor::applyLightTheme()
@@ -1007,6 +1022,7 @@ void CodeEditor::applyLightTheme()
     setMatchedBraceForegroundColor(QColor("#0000cc"));
     setUnmatchedBraceBackgroundColor(QColor("#ffe0e0"));
     setUnmatchedBraceForegroundColor(QColor("#cc0000"));
+    applyFoldStyle(false);
 }
 
 int CodeEditor::currentLine() const
@@ -1112,6 +1128,7 @@ void CodeEditor::applyRemoteText(const QString &newText)
 
     blockSignals(false);
     applyingRemote = false;
+
 }
 
 void CodeEditor::showSearch()
@@ -1343,6 +1360,8 @@ void CodeEditor::goToScintillaPos(int pos)
 
 void CodeEditor::paintRemoteCursors(QWidget *overlay)
 {
+    labelHitRects.clear();
+
     if (remoteCursorPositions.isEmpty())
         return;
 
@@ -1383,6 +1402,7 @@ void CodeEditor::paintRemoteCursors(QWidget *overlay)
             painter.fillRect(x, labelY, labelW, labelH, color);
             painter.setPen(Qt::white);
             painter.drawText(QRect(x, labelY, labelW, labelH), Qt::AlignCenter, label);
+            labelHitRects[siteId] = QRect(x, labelY, labelW, labelH);
         }
     }
 }
@@ -1659,99 +1679,43 @@ void CodeEditor::onAutoCompleted(const char *sel, int pos, int /*ch*/, int /*met
     autocWordLen = 0;
 }
 
-void CodeEditor::updateOverviewMarks()
+void CodeEditor::applyFoldStyle(bool dark)
 {
-    markerDeleteAll(MARKER_CHANGE_ADDED);
-    markerDeleteAll(MARKER_CHANGE_MODIFIED);
-    overviewMarks.clear();
+    const QColor arrowFg = dark ? QColor("#606060") : QColor("#aaaaaa");
+    const QColor marginBg = dark ? QColor("#1e1e1e") : QColor("#f3f3f3");
 
-    const QStringList cur = text().split('\n');
-    const int m = savedLines.size();
-    const int n = cur.size();
+    // Closed header ▶ / open header ▼
+    SendScintilla(SCI_MARKERDEFINE, SC_MARKNUM_FOLDER, SC_MARK_ARROW);
+    SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDER, arrowFg);
+    SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDER, marginBg);
 
-    struct LineInfo
-    {
-        int lineNum;
-        QString content;
-    };
-    QVector<LineInfo> savedNE, curNE;
-    savedNE.reserve(m);
-    curNE.reserve(n);
-    for (int i = 0; i < m; ++i)
-        if (!savedLines[i].trimmed().isEmpty())
-            savedNE.append({i, savedLines[i]});
-    for (int j = 0; j < n; ++j)
-        if (!cur[j].trimmed().isEmpty())
-            curNE.append({j, cur[j]});
+    SendScintilla(SCI_MARKERDEFINE, SC_MARKNUM_FOLDEROPEN, SC_MARK_ARROWDOWN);
+    SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDEROPEN, arrowFg);
+    SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDEROPEN, marginBg);
 
-    const int sm = savedNE.size();
-    const int sn = curNE.size();
+    // Nested fold end markers — same arrows
+    SendScintilla(SCI_MARKERDEFINE, SC_MARKNUM_FOLDEREND, SC_MARK_ARROW);
+    SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDEREND, arrowFg);
+    SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDEREND, marginBg);
 
-    if (sm > 3000 || sn > 3000) {
-        for (int i = 0; i < qMin(sm, sn); ++i) {
-            if (curNE[i].content != savedNE[i].content)
-                markerAdd(curNE[i].lineNum, MARKER_CHANGE_MODIFIED);
-        }
-        for (int i = sm; i < sn; ++i)
-            markerAdd(curNE[i].lineNum, MARKER_CHANGE_ADDED);
-    } else {
-        QVector<QVector<int>> dp(sm + 1, QVector<int>(sn + 1, 0));
-        for (int i = 1; i <= sm; ++i)
-            for (int j = 1; j <= sn; ++j)
-                dp[i][j] = (savedNE[i - 1].content == curNE[j - 1].content)
-                               ? dp[i - 1][j - 1] + 1
-                               : qMax(dp[i - 1][j], dp[i][j - 1]);
+    SendScintilla(SCI_MARKERDEFINE, SC_MARKNUM_FOLDEROPENMID, SC_MARK_ARROWDOWN);
+    SendScintilla(SCI_MARKERSETFORE, SC_MARKNUM_FOLDEROPENMID, arrowFg);
+    SendScintilla(SCI_MARKERSETBACK, SC_MARKNUM_FOLDEROPENMID, marginBg);
 
-        struct Op
-        {
-            enum Kind { Equal, Del, Ins } kind;
-            int ci;
-        };
-        QVector<Op> ops;
-        ops.reserve(sm + sn);
-        {
-            int i = sm, j = sn;
-            while (i > 0 || j > 0) {
-                if (i > 0 && j > 0 && savedNE[i - 1].content == curNE[j - 1].content) {
-                    ops.append({Op::Equal, curNE[j - 1].lineNum});
-                    --i;
-                    --j;
-                } else if (j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-                    ops.append({Op::Ins, curNE[j - 1].lineNum});
-                    --j;
-                } else {
-                    ops.append({Op::Del, -1});
-                    --i;
-                }
-            }
-            std::reverse(ops.begin(), ops.end());
-        }
-
-        int k = 0;
-        while (k < ops.size()) {
-            if (ops[k].kind == Op::Equal) {
-                ++k;
-                continue;
-            }
-            const int start = k;
-            bool hasDel = false;
-            while (k < ops.size() && ops[k].kind != Op::Equal) {
-                if (ops[k].kind == Op::Del)
-                    hasDel = true;
-                ++k;
-            }
-            for (int x = start; x < k; ++x) {
-                if (ops[x].kind != Op::Ins)
-                    continue;
-                const int lineNum = ops[x].ci;
-                const bool wasNew = lineNum >= m || savedLines[lineNum].trimmed().isEmpty();
-                const int marker = (hasDel && !wasNew) ? MARKER_CHANGE_MODIFIED
-                                                       : MARKER_CHANGE_ADDED;
-                markerAdd(lineNum, marker);
-            }
-        }
+    // Body/tail markers — invisible (no lines through body, clean VS Code look)
+    for (int m : {SC_MARKNUM_FOLDERSUB, SC_MARKNUM_FOLDERMIDTAIL, SC_MARKNUM_FOLDERTAIL}) {
+        SendScintilla(SCI_MARKERDEFINE, m, SC_MARK_EMPTY);
+        SendScintilla(SCI_MARKERSETBACK, m, marginBg);
     }
 
+    // Clear fold flags — prevent the default black line that QsciScintilla/Scintilla
+    // draws after contracted folds (SC_FOLDFLAG_LINEAFTER_CONTRACTED causes it)
+    SendScintilla(SCI_SETFOLDFLAGS, 0);
+}
+
+void CodeEditor::updateScrollOverview()
+{
+    overviewMarks.clear();
     for (const ErrorInfo &err : std::as_const(errorList)) {
         const OverviewMark::Type t = err.message.startsWith('W') ? OverviewMark::Warning
                                                                  : OverviewMark::Error;
@@ -1760,6 +1724,16 @@ void CodeEditor::updateOverviewMarks()
     if (overviewRuler)
         overviewRuler->update();
 }
+
+void CodeEditor::onScintillaModified(int /*pos*/, int mtype, const char * /*text*/, int /*len*/,
+                                      int /*linesAdded*/, int /*line*/, int /*foldNow*/,
+                                      int /*foldPrev*/, int /*token*/, int /*annotLines*/)
+{
+    if (!((mtype & SC_MOD_INSERTTEXT) || (mtype & SC_MOD_DELETETEXT)))
+        return;
+}
+
+
 
 void CodeEditor::paintScrollOverview(QWidget *ruler)
 {

@@ -716,7 +716,26 @@ void VoiceChat::onAudioInputReady()
             sum += float(s[i]) * float(s[i]);
         const float rms = (n > 0 && !micMuted) ? std::sqrt(sum / float(n)) : 0.0f;
 
-        if (rms > SPEAKING_THRESHOLD) {
+        if (rms > vadNoiseFloor * VAD_MULTIPLIER) {
+            ++vadConsecutive;
+            if (vadActive || vadConsecutive >= VAD_CONFIRM_FRAMES) {
+                vadActive = true;
+                vadSpeechTimer.restart();
+            }
+        } else {
+            vadConsecutive = 0;
+            if (vadActive) {
+                if (rms > vadNoiseFloor * VAD_HOLD_MULTIPLIER)
+                    vadSpeechTimer.restart();
+                else if (vadSpeechTimer.elapsed() >= VAD_HANGOVER_MS)
+                    vadActive = false;
+            } else {
+                float newFloor = vadNoiseFloor * (1.0f - VAD_ADAPT_RATE) + rms * VAD_ADAPT_RATE;
+                vadNoiseFloor = std::max(newFloor, VAD_MIN_NOISE_FLOOR);
+            }
+        }
+
+        if (vadActive) {
             silenceTimer->start();
             if (!isSpeaking) {
                 isSpeaking = true;
@@ -732,7 +751,7 @@ void VoiceChat::onAudioInputReady()
         }
     }
 
-    if (micMuted)
+    if (micMuted || !vadActive)
         return;
 
     captureBuffer.append(data);

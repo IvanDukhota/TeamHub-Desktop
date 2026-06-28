@@ -106,6 +106,7 @@ void RGAManager::localRemove(int bytePos)
     QJsonObject msg;
     msg["type"] = "delete";
     msg["id"] = idToJson(id);
+    msg["siteId"] = siteId;
     sendMessage(msg);
 
     emit textChanged(sequence.toText());

@@ -626,8 +626,11 @@ QWidget *TeamsPanel::makeRoomRow(const TeamManager::RoomInfo &room)
     h->addLayout(textCol, 1);
 
     auto *btnJoin = new QPushButton("Join");
-    btnJoin->setObjectName("primaryBtn");
     btnJoin->setFixedWidth(52);
+    btnJoin->setStyleSheet("QPushButton { background: #0e639c; color: #ffffff; border: none; "
+                           "border-radius: 4px; padding: 4px 0; font-size: 11px; }"
+                           "QPushButton:hover { background: #1177bb; }"
+                           "QPushButton:pressed { background: #0a4f7e; }");
     const QString roomKey = room.roomKey;
     const QString roomName = room.name;
     const QString teamId = selectedTeamId;

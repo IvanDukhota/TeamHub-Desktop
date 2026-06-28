@@ -42,6 +42,7 @@ void CollabSession::disconnectFromServer()
 {
     wantReconnect = false;
     reconnectTimer->stop();
+    pendingQueue.clear();
     socket->close();
 }
 
@@ -270,6 +271,8 @@ void CollabSession::onConnected()
     reconnectAttempt = 0;
     reconnectTimer->stop();
     sendRegister();
+    while (!pendingQueue.isEmpty())
+        socket->sendTextMessage(QJsonDocument(pendingQueue.dequeue()).toJson(QJsonDocument::Compact));
     emit connected();
 }
 
@@ -305,6 +308,7 @@ void CollabSession::scheduleReconnect()
         return;
     if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
         wantReconnect = false;
+        pendingQueue.clear();
         emit errorOccurred("Connection lost. Failed to reconnect after "
                            + QString::number(MAX_RECONNECT_ATTEMPTS) + " attempts.");
         return;
@@ -488,6 +492,13 @@ void CollabSession::handleMessage(const QJsonObject &obj)
     if (type == "insert" || type == "delete" || type == "undelete") {
         if (file.isEmpty())
             return;
+        int actorSiteId = 0;
+        if (type == "insert")
+            actorSiteId = obj["node"].toObject()["id"].toObject()["siteId"].toInt();
+        else
+            actorSiteId = obj["siteId"].toInt();
+        if (actorSiteId != 0 && actorSiteId != currentSiteId)
+            emit remoteOpReceived(actorSiteId, type);
         if (active.contains(file))
             active[file]->handleIncomingMessage(obj);
         else
@@ -499,12 +510,22 @@ void CollabSession::handleMessage(const QJsonObject &obj)
 
 void CollabSession::sendMessage(const QJsonObject &msg)
 {
-    if (!isConnected())
-        return;
     if (mode == Mode::ReadOnly) {
         const QString t = msg["type"].toString();
         if (t == "insert" || t == "delete")
             return;
+    }
+    if (!isConnected()) {
+        if (wantReconnect) {
+            const QString t = msg["type"].toString();
+            if (t == "insert" || t == "delete" || t == "undelete"
+                || t == "snapshot" || t == "file_create"
+                || t == "file_delete" || t == "file_rename"
+                || t == "final_state") {
+                pendingQueue.enqueue(msg);
+            }
+        }
+        return;
     }
     socket->sendTextMessage(QJsonDocument(msg).toJson(QJsonDocument::Compact));
 }

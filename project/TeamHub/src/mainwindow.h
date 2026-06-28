@@ -117,6 +117,11 @@ private:
     QMap<int, QString> peerNames;
     QMap<int, QString> peerAvatars;
     QMap<int, QString> peerRoles;
+    QMap<int, int> peerInserts;
+    QMap<int, int> peerDeletes;
+    QMap<int, bool> peerTyping;
+    QMap<int, QTimer *> typingTimers;
+    QTimer *metricsRefreshTimer = nullptr;
     QString currentCollabFile;
 
     // Session report
@@ -204,12 +209,16 @@ private:
 
     void onCollabUsersUpdated(QMap<int, QString> users);
     void onRemoteFileFocusChanged(int siteId, const QString &file);
+    void onRemoteOpReceived(int siteId, const QString &opType);
     void refreshCollabUsersList();
     void refreshPresenceBar();
     QWidget *makeCollabUserRow(int id,
                                const QString &label,
                                const QString &avatarUrl,
-                               const QString &role = {});
+                               const QString &role = {},
+                               int inserts = 0,
+                               int deletes = 0,
+                               bool typing = false);
 
 private slots:
     void onActivityButton(int page);

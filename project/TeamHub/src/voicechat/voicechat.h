@@ -10,6 +10,7 @@
 #include <QNetworkInterface>
 #include <QObject>
 #include <QRandomGenerator>
+#include <QElapsedTimer>
 #include <QTimer>
 #include <QUdpSocket>
 #include <QWebSocket>
@@ -138,7 +139,17 @@ private:
 
     QTimer *silenceTimer = nullptr;
     bool isSpeaking = false;
-    static constexpr float SPEAKING_THRESHOLD = 800.0f;
+
+    float vadNoiseFloor = 150.0f;
+    bool vadActive = false;
+    QElapsedTimer vadSpeechTimer;
+    int vadConsecutive = 0;
+    static constexpr int   VAD_HANGOVER_MS      = 700;
+    static constexpr float VAD_MULTIPLIER       = 2.0f;
+    static constexpr float VAD_HOLD_MULTIPLIER  = 1.2f;
+    static constexpr float VAD_ADAPT_RATE       = 0.01f;
+    static constexpr float VAD_MIN_NOISE_FLOOR  = 80.0f;
+    static constexpr int   VAD_CONFIRM_FRAMES   = 2;
 };
 
 #endif // VOICECHAT_H

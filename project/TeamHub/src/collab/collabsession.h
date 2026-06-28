@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QMap>
 #include <QObject>
+#include <QQueue>
 #include <QString>
 #include <QStringList>
 #include <QTimer>
@@ -79,6 +80,7 @@ signals:
     void sessionReportReady(const SessionReportData &report);
     void sessionAiInsightsReady(const AiInsights &ai);
     void peerRoleChanged(int siteId, QString role);
+    void remoteOpReceived(int siteId, const QString &opType);
 
 private slots:
     void onConnected();
@@ -129,6 +131,8 @@ private:
     QMap<QString, QDateTime> lastUsed;
     QMap<QString, QMap<int, int>> cursorCache;
     qint64 startEpoch = 0;
+
+    QQueue<QJsonObject> pendingQueue;
 };
 
 #endif // COLLABSESSION_H
